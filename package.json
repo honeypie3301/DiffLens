@@ -8,6 +8,7 @@
     "start": "tsx server.ts",
     "build": "vite build",
     "build:static": "vite build",
+    "build:wasm": "cargo build --manifest-path rust-diff-core/Cargo.toml --release --target wasm32-unknown-unknown && cp rust-diff-core/target/wasm32-unknown-unknown/release/rust_diff_core.wasm src/wasm/diff_core.wasm",
     "preview": "vite preview",
     "clean": "rm -rf dist server.js",
     "lint": "tsc --noEmit"

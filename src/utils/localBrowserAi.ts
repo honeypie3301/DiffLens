@@ -5,11 +5,128 @@ interface TextGenPipeline {
   ): Promise<Array<{ generated_text?: Array<{ role?: string; content?: string }> | string }>>;
 }
 
+export interface DeviceCapabilities {
+  deviceMemoryGb: number | null;
+  cpuCores: number | null;
+  hasWebGpu: boolean;
+  gpuLabel: string | null;
+  freeStorageMb: number | null;
+  saveData: boolean;
+  effectiveConnection: string | null;
+  isCached: boolean;
+  isLowEnd: boolean;
+  warnings: string[];
+}
+
 let cachedGenerator: TextGenPipeline | null = null;
 let cachedDevice: 'webgpu' | 'wasm' = 'wasm';
 
 const MODEL_ID = 'onnx-community/Qwen2.5-0.5B-Instruct';
 const CDN_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1/+esm';
+
+export async function inspectDeviceCapabilities(): Promise<DeviceCapabilities> {
+  const nav = navigator as unknown as {
+    deviceMemory?: number;
+    hardwareConcurrency?: number;
+    gpu?: {
+      requestAdapter?: () => Promise<{
+        info?: { description?: string; vendor?: string; architecture?: string };
+      } | null>;
+    };
+    storage?: {
+      estimate?: () => Promise<{ quota?: number; usage?: number }>;
+    };
+    connection?: {
+      saveData?: boolean;
+      effectiveType?: string;
+    };
+  };
+
+  const deviceMemoryGb = typeof nav.deviceMemory === 'number' ? nav.deviceMemory : null;
+  const cpuCores = typeof nav.hardwareConcurrency === 'number' ? nav.hardwareConcurrency : null;
+  const saveData = Boolean(nav.connection?.saveData);
+  const effectiveConnection = nav.connection?.effectiveType ?? null;
+
+  let hasWebGpu = false;
+  let gpuLabel: string | null = null;
+  try {
+    if (nav.gpu?.requestAdapter) {
+      const adapter = await nav.gpu.requestAdapter();
+      if (adapter) {
+        hasWebGpu = true;
+        const info = adapter.info;
+        const parts = [info?.vendor, info?.description || info?.architecture].filter(Boolean);
+        gpuLabel = parts.length > 0 ? parts.join(' ') : 'WebGPU GPU adapter';
+      }
+    }
+  } catch {
+    hasWebGpu = false;
+  }
+
+  let freeStorageMb: number | null = null;
+  try {
+    if (nav.storage?.estimate) {
+      const est = await nav.storage.estimate();
+      if (typeof est.quota === 'number') {
+        const used = typeof est.usage === 'number' ? est.usage : 0;
+        freeStorageMb = Math.max(0, Math.round((est.quota - used) / (1024 * 1024)));
+      }
+    }
+  } catch {
+    freeStorageMb = null;
+  }
+
+  let isCached = Boolean(cachedGenerator);
+  if (!isCached && typeof caches !== 'undefined') {
+    try {
+      const cache = await caches.open('transformers-cache');
+      const keys = await cache.keys();
+      isCached = keys.some(
+        (req) => req.url.includes('Qwen2.5-0.5B-Instruct') && req.url.includes('.onnx')
+      );
+    } catch {
+      isCached = false;
+    }
+  }
+
+  const warnings: string[] = [];
+  if (deviceMemoryGb !== null && deviceMemoryGb <= 4) {
+    warnings.push(`Limited system memory (${deviceMemoryGb} GB reported; model uses ~600 MB–1 GB).`);
+  }
+  if (cpuCores !== null && cpuCores < 4 && !hasWebGpu) {
+    warnings.push(`Low CPU core count (${cpuCores} cores) without GPU acceleration.`);
+  }
+  if (!hasWebGpu) {
+    warnings.push('WebGPU unavailable — will fall back to slower CPU WebAssembly inference.');
+  }
+  if (!isCached && freeStorageMb !== null && freeStorageMb < 750) {
+    warnings.push(`Low browser cache quota (~${freeStorageMb} MB free; ~420 MB required).`);
+  }
+  if (
+    !isCached &&
+    (saveData ||
+      effectiveConnection === 'slow-2g' ||
+      effectiveConnection === '2g' ||
+      effectiveConnection === '3g')
+  ) {
+    warnings.push(
+      `Slow or metered network (${effectiveConnection || 'Data Saver'}) for a ~390 MB initial download.`
+    );
+  }
+
+  return {
+    deviceMemoryGb,
+    cpuCores,
+    hasWebGpu,
+    gpuLabel,
+    freeStorageMb,
+    saveData,
+    effectiveConnection,
+    isCached,
+    isLowEnd: warnings.length > 0,
+    warnings,
+  };
+}
 
 export async function runInBrowserLocalAI(
   hunksPatch: string,
@@ -26,11 +143,28 @@ export async function runInBrowserLocalAI(
         model: string,
         opts: Record<string, unknown>
       ) => Promise<TextGenPipeline>;
-      env?: { allowLocalModels?: boolean };
+      env?: {
+        allowLocalModels?: boolean;
+        allowRemoteModels?: boolean;
+        useBrowserCache?: boolean;
+        backends?: { onnx?: { wasm?: { numThreads?: number } } };
+      };
     };
 
     if (transformers.env) {
       transformers.env.allowLocalModels = false;
+      transformers.env.allowRemoteModels = true;
+      transformers.env.useBrowserCache = true;
+      if (
+        typeof self !== 'undefined' &&
+        (self as unknown as { crossOriginIsolated?: boolean }).crossOriginIsolated &&
+        transformers.env.backends?.onnx?.wasm
+      ) {
+        transformers.env.backends.onnx.wasm.numThreads = Math.min(
+          4,
+          navigator.hardwareConcurrency || 2
+        );
+      }
     }
 
     let useWebGpu = false;

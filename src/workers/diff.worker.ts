@@ -1,4 +1,5 @@
 import { diffChars, diffLines, diffWordsWithSpace, type Change } from 'diff';
+import wasmUrl from '../wasm/diff_core.wasm?url';
 import type {
   DiffResult,
   DiffWorkerRequest,
@@ -8,6 +9,65 @@ import type {
   SplitRow,
   UnifiedRow,
 } from '../types/diff';
+
+interface RustWasmExports {
+  memory: WebAssembly.Memory;
+  alloc: (len: number) => number;
+  dealloc: (ptr: number, len: number) => void;
+  result_ptr: () => number;
+  result_len: () => number;
+  compute_diff: (
+    leftPtr: number,
+    leftLen: number,
+    rightPtr: number,
+    rightLen: number,
+    flags: number
+  ) => number;
+  compute_intraline: (
+    leftPtr: number,
+    leftLen: number,
+    rightPtr: number,
+    rightLen: number,
+    charMode: number
+  ) => number;
+}
+
+const textEncoder = new TextEncoder();
+let wasmExports: RustWasmExports | null = null;
+let wasmInitPromise: Promise<RustWasmExports | null> | null = null;
+
+function ensureWasm(): Promise<RustWasmExports | null> {
+  if (wasmExports) return Promise.resolve(wasmExports);
+  if (wasmInitPromise) return wasmInitPromise;
+
+  wasmInitPromise = (async () => {
+    try {
+      const response = await fetch(wasmUrl);
+      if (!response.ok) return null;
+      let instance: WebAssembly.Instance;
+      if ('instantiateStreaming' in WebAssembly) {
+        try {
+          const streamed = await WebAssembly.instantiateStreaming(response.clone());
+          instance = streamed.instance;
+        } catch {
+          const bytes = await response.arrayBuffer();
+          const instantiated = await WebAssembly.instantiate(bytes);
+          instance = instantiated.instance;
+        }
+      } else {
+        const bytes = await response.arrayBuffer();
+        const instantiated = await WebAssembly.instantiate(bytes);
+        instance = instantiated.instance;
+      }
+      wasmExports = instance.exports as unknown as RustWasmExports;
+      return wasmExports;
+    } catch {
+      return null;
+    }
+  })();
+
+  return wasmInitPromise;
+}
 
 function splitLinesPreserve(text: string): string[] {
   if (!text) return [];
@@ -30,12 +90,71 @@ function normalizeForCompare(line: string, ignoreWhitespace: boolean, ignoreCase
   return out;
 }
 
-function computeFastIntraline(
+function runWasmIntraline(
+  wasm: RustWasmExports,
   leftLine: string,
   rightLine: string,
   mode: 'word' | 'char'
 ): { leftSegments: InlineSegment[]; rightSegments: InlineSegment[] } {
-  // Fast path for extremely long minified lines so UI never stalls
+  const leftBytes = textEncoder.encode(leftLine);
+  const rightBytes = textEncoder.encode(rightLine);
+
+  const leftPtr = wasm.alloc(leftBytes.length);
+  const rightPtr = wasm.alloc(rightBytes.length);
+
+  try {
+    if (leftBytes.length > 0) {
+      new Uint8Array(wasm.memory.buffer, leftPtr, leftBytes.length).set(leftBytes);
+    }
+    if (rightBytes.length > 0) {
+      new Uint8Array(wasm.memory.buffer, rightPtr, rightBytes.length).set(rightBytes);
+    }
+
+    const opLen = wasm.compute_intraline(
+      leftPtr,
+      leftBytes.length,
+      rightPtr,
+      rightBytes.length,
+      mode === 'char' ? 1 : 0
+    );
+    const outPtr = wasm.result_ptr();
+    const view = new Uint32Array(wasm.memory.buffer, outPtr, opLen);
+
+    const leftSegments: InlineSegment[] = [];
+    const rightSegments: InlineSegment[] = [];
+    let li = 0;
+    let ri = 0;
+
+    for (let i = 0; i < opLen; i += 2) {
+      const kind = view[i];
+      const utf16Count = view[i + 1];
+      if (kind === 0) {
+        leftSegments.push({ text: leftLine.slice(li, li + utf16Count), changed: false });
+        rightSegments.push({ text: rightLine.slice(ri, ri + utf16Count), changed: false });
+        li += utf16Count;
+        ri += utf16Count;
+      } else if (kind === 1) {
+        leftSegments.push({ text: leftLine.slice(li, li + utf16Count), changed: true });
+        li += utf16Count;
+      } else {
+        rightSegments.push({ text: rightLine.slice(ri, ri + utf16Count), changed: true });
+        ri += utf16Count;
+      }
+    }
+
+    return { leftSegments, rightSegments };
+  } finally {
+    wasm.dealloc(leftPtr, leftBytes.length);
+    wasm.dealloc(rightPtr, rightBytes.length);
+  }
+}
+
+function computeFastIntraline(
+  wasm: RustWasmExports | null,
+  leftLine: string,
+  rightLine: string,
+  mode: 'word' | 'char'
+): { leftSegments: InlineSegment[]; rightSegments: InlineSegment[] } {
   if (leftLine.length > 3500 || rightLine.length > 3500) {
     let prefix = 0;
     const minLen = Math.min(leftLine.length, rightLine.length);
@@ -66,6 +185,10 @@ function computeFastIntraline(
     return { leftSegments, rightSegments };
   }
 
+  if (wasm) {
+    return runWasmIntraline(wasm, leftLine, rightLine, mode);
+  }
+
   const changes: Change[] =
     mode === 'char'
       ? diffChars(leftLine, rightLine)
@@ -88,7 +211,59 @@ function computeFastIntraline(
   return { leftSegments, rightSegments };
 }
 
-function computeDiff(req: DiffWorkerRequest): DiffResult {
+type RawOp =
+  | { type: 'equal'; count: number }
+  | { type: 'remove'; count: number }
+  | { type: 'add'; count: number };
+
+function runWasmLineDiff(
+  wasm: RustWasmExports,
+  midLeftText: string,
+  midRightText: string,
+  ignoreWhitespace: boolean,
+  ignoreCase: boolean
+): RawOp[] {
+  const leftBytes = textEncoder.encode(midLeftText);
+  const rightBytes = textEncoder.encode(midRightText);
+  const leftPtr = wasm.alloc(leftBytes.length);
+  const rightPtr = wasm.alloc(rightBytes.length);
+
+  try {
+    if (leftBytes.length > 0) {
+      new Uint8Array(wasm.memory.buffer, leftPtr, leftBytes.length).set(leftBytes);
+    }
+    if (rightBytes.length > 0) {
+      new Uint8Array(wasm.memory.buffer, rightPtr, rightBytes.length).set(rightBytes);
+    }
+
+    const flags = (ignoreWhitespace ? 1 : 0) | (ignoreCase ? 2 : 0);
+    const opLen = wasm.compute_diff(
+      leftPtr,
+      leftBytes.length,
+      rightPtr,
+      rightBytes.length,
+      flags
+    );
+    const outPtr = wasm.result_ptr();
+    const view = new Uint32Array(wasm.memory.buffer, outPtr, opLen);
+
+    const ops: RawOp[] = [];
+    for (let i = 0; i < opLen; i += 2) {
+      const kind = view[i];
+      const count = view[i + 1];
+      if (count === 0) continue;
+      if (kind === 0) ops.push({ type: 'equal', count });
+      else if (kind === 1) ops.push({ type: 'remove', count });
+      else ops.push({ type: 'add', count });
+    }
+    return ops;
+  } finally {
+    wasm.dealloc(leftPtr, leftBytes.length);
+    wasm.dealloc(rightPtr, rightBytes.length);
+  }
+}
+
+function computeDiff(req: DiffWorkerRequest, wasm: RustWasmExports | null): DiffResult {
   const startTime = performance.now();
 
   const rawLeft = splitLinesPreserve(req.leftText);
@@ -97,7 +272,6 @@ function computeDiff(req: DiffWorkerRequest): DiffResult {
   const totalLeftLines = rawLeft.length;
   const totalRightLines = rawRight.length;
 
-  // O(N) common prefix & suffix trimming so massive files with localized edits finish in milliseconds
   let prefixLen = 0;
   const minLines = Math.min(totalLeftLines, totalRightLines);
   while (
@@ -128,19 +302,25 @@ function computeDiff(req: DiffWorkerRequest): DiffResult {
   const midLeft = rawLeft.slice(prefixLen, totalLeftLines - suffixLen);
   const midRight = rawRight.slice(prefixLen, totalRightLines - suffixLen);
 
-  type RawOp =
-    | { type: 'equal'; count: number }
-    | { type: 'remove'; lines: string[] }
-    | { type: 'add'; lines: string[] };
-
   const ops: RawOp[] = [];
   if (prefixLen > 0) {
     ops.push({ type: 'equal', count: prefixLen });
   }
 
   if (midLeft.length > 0 || midRight.length > 0) {
-    // Guard against O(ND) blowup if middle section itself is huge (> 12k lines)
-    if (midLeft.length + midRight.length > 12000) {
+    const midLeftText = midLeft.length ? midLeft.join('\n') + '\n' : '';
+    const midRightText = midRight.length ? midRight.join('\n') + '\n' : '';
+
+    if (wasm && midLeft.length + midRight.length <= 25000) {
+      const wasmOps = runWasmLineDiff(
+        wasm,
+        midLeftText,
+        midRightText,
+        req.ignoreWhitespace,
+        req.ignoreCase
+      );
+      for (const op of wasmOps) ops.push(op);
+    } else if (midLeft.length + midRight.length > 12000) {
       const chunkSize = 2500;
       const chunks = Math.max(
         Math.ceil(midLeft.length / chunkSize),
@@ -149,21 +329,33 @@ function computeDiff(req: DiffWorkerRequest): DiffResult {
       for (let c = 0; c < chunks; c++) {
         const lSlice = midLeft.slice(c * chunkSize, (c + 1) * chunkSize);
         const rSlice = midRight.slice(c * chunkSize, (c + 1) * chunkSize);
-        const cmpL = req.ignoreCase ? lSlice.map((l) => l.toLowerCase()) : lSlice;
-        const cmpR = req.ignoreCase ? rSlice.map((l) => l.toLowerCase()) : rSlice;
-        const changes = diffLines(
-          cmpL.join('\n') + (cmpL.length ? '\n' : ''),
-          cmpR.join('\n') + (cmpR.length ? '\n' : ''),
-          {
-            ignoreWhitespace: req.ignoreWhitespace,
+        const lText = lSlice.length ? lSlice.join('\n') + '\n' : '';
+        const rText = rSlice.length ? rSlice.join('\n') + '\n' : '';
+
+        if (wasm) {
+          const wasmOps = runWasmLineDiff(
+            wasm,
+            lText,
+            rText,
+            req.ignoreWhitespace,
+            req.ignoreCase
+          );
+          for (const op of wasmOps) ops.push(op);
+        } else {
+          const cmpL = req.ignoreCase ? lSlice.map((l) => l.toLowerCase()) : lSlice;
+          const cmpR = req.ignoreCase ? rSlice.map((l) => l.toLowerCase()) : rSlice;
+          const changes = diffLines(
+            cmpL.length ? cmpL.join('\n') + '\n' : '',
+            cmpR.length ? cmpR.join('\n') + '\n' : '',
+            { ignoreWhitespace: req.ignoreWhitespace }
+          );
+          for (const ch of changes) {
+            const lines = splitLinesPreserve(ch.value);
+            if (lines.length === 0) continue;
+            if (ch.added) ops.push({ type: 'add', count: lines.length });
+            else if (ch.removed) ops.push({ type: 'remove', count: lines.length });
+            else ops.push({ type: 'equal', count: lines.length });
           }
-        );
-        for (const ch of changes) {
-          const lines = splitLinesPreserve(ch.value);
-          if (lines.length === 0) continue;
-          if (ch.added) ops.push({ type: 'add', lines });
-          else if (ch.removed) ops.push({ type: 'remove', lines });
-          else ops.push({ type: 'equal', count: lines.length });
         }
       }
     } else {
@@ -178,13 +370,9 @@ function computeDiff(req: DiffWorkerRequest): DiffResult {
       for (const ch of changes) {
         const lines = splitLinesPreserve(ch.value);
         if (lines.length === 0) continue;
-        if (ch.added) {
-          ops.push({ type: 'add', lines });
-        } else if (ch.removed) {
-          ops.push({ type: 'remove', lines });
-        } else {
-          ops.push({ type: 'equal', count: lines.length });
-        }
+        if (ch.added) ops.push({ type: 'add', count: lines.length });
+        else if (ch.removed) ops.push({ type: 'remove', count: lines.length });
+        else ops.push({ type: 'equal', count: lines.length });
       }
     }
   }
@@ -239,7 +427,6 @@ function computeDiff(req: DiffWorkerRequest): DiffResult {
       continue;
     }
 
-    // Group adjacent remove + add blocks into a single hunk
     const hunkIndex = hunks.length;
     const splitStartRow = splitRows.length;
     const unifiedStartRow = unifiedRows.length;
@@ -253,14 +440,14 @@ function computeDiff(req: DiffWorkerRequest): DiffResult {
       const current = ops[i];
       if (current.type === 'remove') {
         removedLines = removedLines.concat(
-          rawLeft.slice(leftCursor, leftCursor + current.lines.length)
+          rawLeft.slice(leftCursor, leftCursor + current.count)
         );
-        leftCursor += current.lines.length;
+        leftCursor += current.count;
       } else if (current.type === 'add') {
         addedLines = addedLines.concat(
-          rawRight.slice(rightCursor, rightCursor + current.lines.length)
+          rawRight.slice(rightCursor, rightCursor + current.count)
         );
-        rightCursor += current.lines.length;
+        rightCursor += current.count;
       }
       i++;
     }
@@ -271,11 +458,12 @@ function computeDiff(req: DiffWorkerRequest): DiffResult {
     const maxPairs = Math.max(removedLines.length, addedLines.length);
     const minPairs = Math.min(removedLines.length, addedLines.length);
 
-    // Precompute intraline segments for paired lines (up to reasonable batch of 250 paired lines per hunk)
     const pairSegments: Array<{ leftSegments: InlineSegment[]; rightSegments: InlineSegment[] }> = [];
     for (let p = 0; p < minPairs; p++) {
       if (p < 250) {
-        pairSegments.push(computeFastIntraline(removedLines[p], addedLines[p], req.intralineMode));
+        pairSegments.push(
+          computeFastIntraline(wasm, removedLines[p], addedLines[p], req.intralineMode)
+        );
       } else {
         pairSegments.push({
           leftSegments: [{ text: removedLines[p], changed: true }],
@@ -324,7 +512,6 @@ function computeDiff(req: DiffWorkerRequest): DiffResult {
       }
     }
 
-    // Unified ordering: all removed lines first, then all added lines
     for (let p = 0; p < removedLines.length; p++) {
       unifiedRows.push({
         kind: 'remove',
@@ -357,12 +544,10 @@ function computeDiff(req: DiffWorkerRequest): DiffResult {
     });
   }
 
-  // Build compact unified hunk patch with +/-3 context lines (for AI Explain & .patch export)
   const patchLines: string[] = [];
   const contextRadius = 3;
   let hIdx = 0;
   while (hIdx < hunks.length) {
-    // Merge nearby hunks if context overlaps
     let groupEnd = hIdx;
     while (
       groupEnd + 1 < hunks.length &&
@@ -422,8 +607,12 @@ function computeDiff(req: DiffWorkerRequest): DiffResult {
   };
 }
 
-self.onmessage = (event: MessageEvent<DiffWorkerRequest>) => {
-  const result = computeDiff(event.data);
+// Kick off WASM instantiation immediately on worker load
+void ensureWasm();
+
+self.onmessage = async (event: MessageEvent<DiffWorkerRequest>) => {
+  const wasm = await ensureWasm();
+  const result = computeDiff(event.data, wasm);
   const response: DiffWorkerResponse = {
     id: event.data.id,
     result,

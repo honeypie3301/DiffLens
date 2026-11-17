@@ -6,4 +6,5 @@ coverage/
 *.log
 .env*
 !.env.example
+rust-diff-core/target/
 /public/assets/aistudio

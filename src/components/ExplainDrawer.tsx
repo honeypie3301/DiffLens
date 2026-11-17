@@ -1,5 +1,18 @@
 import React, { useState } from 'react';
-import { Sparkles, X, RefreshCw, Copy, Check, AlertCircle, Cpu } from 'lucide-react';
+import {
+  Sparkles,
+  X,
+  RefreshCw,
+  Copy,
+  Check,
+  AlertCircle,
+  AlertTriangle,
+  Cpu,
+} from 'lucide-react';
+import {
+  inspectDeviceCapabilities,
+  type DeviceCapabilities,
+} from '../utils/localBrowserAi';
 
 interface ExplainDrawerProps {
   open: boolean;
@@ -57,6 +70,8 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
   hunksPatch,
 }) => {
   const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [checkingSpecs, setCheckingSpecs] = useState(false);
+  const [pendingCaps, setPendingCaps] = useState<DeviceCapabilities | null>(null);
 
   if (!open) return null;
 
@@ -65,6 +80,21 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
     navigator.clipboard?.writeText(prompt).catch(() => {});
     setCopiedPrompt(true);
     setTimeout(() => setCopiedPrompt(false), 1600);
+  };
+
+  const handleLocalAiRequest = async () => {
+    if (!onRunLocalBrowserAI) return;
+    setCheckingSpecs(true);
+    try {
+      const caps = await inspectDeviceCapabilities();
+      if (caps.isLowEnd || !caps.isCached) {
+        setPendingCaps(caps);
+        return;
+      }
+      onRunLocalBrowserAI();
+    } finally {
+      setCheckingSpecs(false);
+    }
   };
 
   return (
@@ -143,25 +173,106 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
               </div>
             </div>
             {hunksPatch && (
-              <div className="flex flex-wrap items-center gap-2 pt-0.5">
-                {onRunLocalBrowserAI && (
-                  <button
-                    type="button"
-                    onClick={onRunLocalBrowserAI}
-                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-[var(--accent-fg)] font-medium cursor-pointer"
-                  >
-                    <Cpu className="w-3.5 h-3.5" />
-                    <span>Run In-Browser AI</span>
-                  </button>
+              <div className="space-y-2.5 pt-0.5">
+                {pendingCaps ? (
+                  <div className="p-3 rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] space-y-2">
+                    <div className="flex items-start gap-2">
+                      <AlertTriangle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
+                      <div className="space-y-1 min-w-0">
+                        <p className="font-semibold text-[var(--text-primary)]">
+                          {pendingCaps.isLowEnd
+                            ? 'Low-spec hardware or slow fallback detected'
+                            : 'Confirm local model download (~390 MB)'}
+                        </p>
+                        <div className="font-mono text-[0.6875rem] text-[var(--text-muted)] space-y-0.5">
+                          <p>
+                            RAM:{' '}
+                            {pendingCaps.deviceMemoryGb !== null
+                              ? `${pendingCaps.deviceMemoryGb} GB`
+                              : 'Not exposed by browser'}{' '}
+                            · CPU:{' '}
+                            {pendingCaps.cpuCores !== null
+                              ? `${pendingCaps.cpuCores} cores`
+                              : 'Unknown'}
+                          </p>
+                          <p>
+                            Backend:{' '}
+                            {pendingCaps.hasWebGpu
+                              ? pendingCaps.gpuLabel || 'WebGPU'
+                              : 'CPU WebAssembly (slower)'}
+                          </p>
+                          <p>
+                            Cache:{' '}
+                            {pendingCaps.isCached
+                              ? 'Already cached (0 MB download)'
+                              : `Uncached (~390 MB)${
+                                  pendingCaps.freeStorageMb !== null
+                                    ? ` · ${pendingCaps.freeStorageMb.toLocaleString()} MB quota free`
+                                    : ''
+                                }`}
+                          </p>
+                        </div>
+                        {pendingCaps.warnings.length > 0 && (
+                          <ul className="pt-1 space-y-0.5 text-[var(--remove-fg)] list-disc pl-4">
+                            {pendingCaps.warnings.map((w, idx) => (
+                              <li key={idx}>{w}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2 pt-1">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setPendingCaps(null);
+                          onRunLocalBrowserAI?.();
+                        }}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-[var(--accent-fg)] font-medium cursor-pointer"
+                      >
+                        <Cpu className="w-3.5 h-3.5" />
+                        <span>
+                          {pendingCaps.isCached ? 'Run Cached AI' : 'Download & Run Anyway'}
+                        </span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setPendingCaps(null)}
+                        className="px-2.5 py-1.5 rounded border border-[var(--border-strong)] bg-[var(--bg-elevated)] hover:bg-[var(--bg-hover)] text-[var(--text-muted)] font-medium cursor-pointer"
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  </div>
+                ) : (
+                  <div className="flex flex-wrap items-center gap-2">
+                    {onRunLocalBrowserAI && (
+                      <button
+                        type="button"
+                        disabled={checkingSpecs}
+                        onClick={() => void handleLocalAiRequest()}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-[var(--accent-fg)] font-medium cursor-pointer disabled:opacity-60"
+                      >
+                        <Cpu className="w-3.5 h-3.5" />
+                        <span>
+                          {checkingSpecs ? 'Inspecting specs...' : 'Run In-Browser AI'}
+                        </span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={handleCopyPrompt}
+                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] font-medium cursor-pointer"
+                    >
+                      {copiedPrompt ? (
+                        <Check className="w-3.5 h-3.5" />
+                      ) : (
+                        <Copy className="w-3.5 h-3.5" />
+                      )}
+                      <span>{copiedPrompt ? 'Copied Hunk Prompt' : 'Copy Hunk Prompt'}</span>
+                    </button>
+                  </div>
                 )}
-                <button
-                  type="button"
-                  onClick={handleCopyPrompt}
-                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] font-medium cursor-pointer"
-                >
-                  {copiedPrompt ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                  <span>{copiedPrompt ? 'Copied Hunk Prompt' : 'Copy Hunk Prompt'}</span>
-                </button>
               </div>
             )}
           </div>
