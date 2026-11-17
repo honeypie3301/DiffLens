@@ -1,0 +1,6 @@
+{
+  "name": "DiffLens",
+  "description": "High-throughput virtualized code & text diff viewer with syntax highlighting, split/unified views, and adaptive AI change explanations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
