@@ -30,6 +30,7 @@ import type {
 } from './types/diff';
 import { detectLanguage, SUPPORTED_LANGUAGES } from './utils/syntaxHighlight';
 import { decodeShareHash, encodeShareHash, SAMPLE_PRESETS } from './utils/sampleDiff';
+import { runInBrowserLocalAI } from './utils/localBrowserAi';
 import { VirtualDiffViewer } from './components/VirtualDiffViewer';
 import { RawInputEditor } from './components/RawInputEditor';
 import { ExplainDrawer } from './components/ExplainDrawer';
@@ -219,6 +220,7 @@ export default function App() {
 
   const [explainOpen, setExplainOpen] = useState<boolean>(false);
   const [explainLoading, setExplainLoading] = useState<boolean>(false);
+  const [explainStatus, setExplainStatus] = useState<string | null>(null);
   const [explainError, setExplainError] = useState<string | null>(null);
   const [explainSummary, setExplainSummary] = useState<string | null>(null);
   const [explainModel, setExplainModel] = useState<string | null>(null);
@@ -482,6 +484,7 @@ export default function App() {
       setExplainOpen(true);
       setSavedOpen(false);
       setExplainLoading(true);
+      setExplainStatus(null);
       setExplainError(null);
 
       try {
@@ -500,7 +503,7 @@ export default function App() {
         const contentType = res.headers.get('content-type') || '';
         if (!contentType.includes('application/json')) {
           throw new Error(
-            'Static hosting detected (no /api/explain backend). Deploy on Vercel or Node with GEMINI_API_KEY, GROQ_API_KEY, or CEREBRAS_API_KEY, or copy the hunk prompt below.'
+            'GitHub Pages serves static files only (no /api/explain route). You can run the in-browser AI model locally below, connect a Vercel backend via VITE_API_BASE_URL, or copy the hunk prompt.'
           );
         }
 
@@ -528,10 +531,40 @@ export default function App() {
         }
       } finally {
         setExplainLoading(false);
+        setExplainStatus(null);
       }
     },
     [explainFocus, title, effectiveLanguage, diffResult.hunksPatch, diffResult.stats]
   );
+
+  const runLocalBrowserAiFallback = useCallback(async () => {
+    if (!diffResult.hunksPatch) return;
+    setExplainLoading(true);
+    setExplainError(null);
+    setExplainStatus('Initializing in-browser AI...');
+    try {
+      const res = await runInBrowserLocalAI(
+        diffResult.hunksPatch,
+        explainFocus,
+        title,
+        effectiveLanguage,
+        (statusText) => setExplainStatus(statusText)
+      );
+      setExplainSummary(res.summary);
+      setExplainModel(res.modelUsed);
+      setExplainChunks(1);
+      setExplainError(null);
+    } catch (err: unknown) {
+      setExplainError(
+        err instanceof Error
+          ? `In-browser AI failed to initialize: ${err.message}`
+          : 'In-browser AI failed to initialize.'
+      );
+    } finally {
+      setExplainLoading(false);
+      setExplainStatus(null);
+    }
+  }, [diffResult.hunksPatch, explainFocus, title, effectiveLanguage]);
 
   const loadSample = useCallback(() => {
     const preset = SAMPLE_PRESETS[0];
@@ -1180,6 +1213,7 @@ export default function App() {
           open={explainOpen}
           onClose={() => setExplainOpen(false)}
           loading={explainLoading}
+          loadingStatus={explainStatus}
           error={explainError}
           summary={explainSummary}
           modelUsed={explainModel}
@@ -1187,6 +1221,7 @@ export default function App() {
           focus={explainFocus}
           onFocusChange={setExplainFocus}
           onRunExplain={runExplain}
+          onRunLocalBrowserAI={runLocalBrowserAiFallback}
           hunksPatch={diffResult.hunksPatch}
         />
 

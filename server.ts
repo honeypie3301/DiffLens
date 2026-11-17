@@ -17,6 +17,17 @@ async function startServer() {
     res.json({ ok: true, aiConfigured: Boolean(process.env.GEMINI_API_KEY) });
   });
 
+  app.use('/api/explain', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
+
   app.post('/api/explain', async (req, res) => {
     try {
       const payload = req.body as ExplainPayload;

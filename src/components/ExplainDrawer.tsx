@@ -1,10 +1,11 @@
 import React, { useState } from 'react';
-import { Sparkles, X, RefreshCw, Copy, Check, AlertCircle } from 'lucide-react';
+import { Sparkles, X, RefreshCw, Copy, Check, AlertCircle, Cpu } from 'lucide-react';
 
 interface ExplainDrawerProps {
   open: boolean;
   onClose: () => void;
   loading: boolean;
+  loadingStatus?: string | null;
   error: string | null;
   summary: string | null;
   modelUsed: string | null;
@@ -12,6 +13,7 @@ interface ExplainDrawerProps {
   focus: 'concise' | 'detailed' | 'risks';
   onFocusChange: (focus: 'concise' | 'detailed' | 'risks') => void;
   onRunExplain: (focusOverride?: 'concise' | 'detailed' | 'risks') => void;
+  onRunLocalBrowserAI?: () => void;
   hunksPatch: string;
 }
 
@@ -43,6 +45,7 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
   open,
   onClose,
   loading,
+  loadingStatus,
   error,
   summary,
   modelUsed,
@@ -50,6 +53,7 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
   focus,
   onFocusChange,
   onRunExplain,
+  onRunLocalBrowserAI,
   hunksPatch,
 }) => {
   const [copiedPrompt, setCopiedPrompt] = useState(false);
@@ -117,6 +121,9 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
       <div className="diff-scroll flex-1 overflow-y-auto p-4 space-y-3 text-sm leading-relaxed text-[var(--text-primary)]/90">
         {loading && (
           <div className="space-y-2.5 py-2">
+            {loadingStatus && (
+              <p className="text-xs font-mono text-[var(--text-muted)]">{loadingStatus}</p>
+            )}
             <div className="h-3.5 w-3/4 rounded bg-[var(--bg-hover)] animate-pulse" />
             <div className="h-3.5 w-full rounded bg-[var(--bg-hover)] animate-pulse" />
             <div className="h-3.5 w-5/6 rounded bg-[var(--bg-hover)] animate-pulse" />
@@ -136,14 +143,26 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
               </div>
             </div>
             {hunksPatch && (
-              <button
-                type="button"
-                onClick={handleCopyPrompt}
-                className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-[var(--accent-fg)] font-medium cursor-pointer"
-              >
-                {copiedPrompt ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
-                <span>{copiedPrompt ? 'Copied Hunk Prompt' : 'Copy Hunk Prompt'}</span>
-              </button>
+              <div className="flex flex-wrap items-center gap-2 pt-0.5">
+                {onRunLocalBrowserAI && (
+                  <button
+                    type="button"
+                    onClick={onRunLocalBrowserAI}
+                    className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-[var(--accent-fg)] font-medium cursor-pointer"
+                  >
+                    <Cpu className="w-3.5 h-3.5" />
+                    <span>Run In-Browser AI</span>
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={handleCopyPrompt}
+                  className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] font-medium cursor-pointer"
+                >
+                  {copiedPrompt ? <Check className="w-3.5 h-3.5" /> : <Copy className="w-3.5 h-3.5" />}
+                  <span>{copiedPrompt ? 'Copied Hunk Prompt' : 'Copy Hunk Prompt'}</span>
+                </button>
+              </div>
             )}
           </div>
         )}
