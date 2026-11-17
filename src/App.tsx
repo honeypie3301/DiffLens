@@ -30,7 +30,11 @@ import type {
 } from './types/diff';
 import { detectLanguage, SUPPORTED_LANGUAGES } from './utils/syntaxHighlight';
 import { decodeShareHash, encodeShareHash, SAMPLE_PRESETS } from './utils/sampleDiff';
-import { runInBrowserLocalAI } from './utils/localBrowserAi';
+import {
+  compactDiffForLocalAi,
+  generateInstantLocalSummary,
+  runInBrowserLocalAI,
+} from './utils/localBrowserAi';
 import { VirtualDiffViewer } from './components/VirtualDiffViewer';
 import { RawInputEditor } from './components/RawInputEditor';
 import { ExplainDrawer } from './components/ExplainDrawer';
@@ -601,8 +605,9 @@ export default function App() {
           updatedAt: Date.now(),
         });
       } catch (err: unknown) {
+        const { compacted } = compactDiffForLocalAi(diffResult.hunksPatch, 12000);
         const localSummary = await tryChromeBuiltInAI(
-          `Focus: ${activeFocus}\nTitle: ${title}\nLanguage: ${effectiveLanguage}\n\n${diffResult.hunksPatch}`
+          `Focus: ${activeFocus}\nTitle: ${title}\nLanguage: ${effectiveLanguage}\n\n${compacted}`
         ).catch(() => null);
 
         if (localSummary) {
@@ -634,14 +639,16 @@ export default function App() {
     const cacheKey = hashPatchKey(diffResult.hunksPatch, explainFocus);
     setExplainLoading(true);
     setExplainError(null);
-    setExplainStatus('Initializing in-browser AI...');
+    setExplainSummary(null);
+    setExplainStatus('Initializing in-browser AI worker...');
     try {
       const res = await runInBrowserLocalAI(
         diffResult.hunksPatch,
         explainFocus,
         title,
         effectiveLanguage,
-        (statusText) => setExplainStatus(statusText)
+        (statusText) => setExplainStatus(statusText),
+        (partialText) => setExplainSummary(partialText)
       );
       setExplainSummary(res.summary);
       setExplainModel(res.modelUsed);
@@ -655,6 +662,7 @@ export default function App() {
         updatedAt: Date.now(),
       });
     } catch (err: unknown) {
+      setExplainSummary(null);
       setExplainError(
         err instanceof Error
           ? `In-browser AI failed to initialize: ${err.message}`
@@ -665,6 +673,31 @@ export default function App() {
       setExplainStatus(null);
     }
   }, [diffResult.hunksPatch, explainFocus, title, effectiveLanguage]);
+
+  const runInstantOfflineSummary = useCallback(() => {
+    if (!diffResult.hunksPatch) return;
+    const cacheKey = hashPatchKey(diffResult.hunksPatch, explainFocus);
+    const res = generateInstantLocalSummary({
+      hunksPatch: diffResult.hunksPatch,
+      stats: diffResult.stats,
+      focus: explainFocus,
+      title,
+      language: effectiveLanguage,
+    });
+    setExplainError(null);
+    setExplainLoading(false);
+    setExplainStatus(null);
+    setExplainSummary(res.summary);
+    setExplainModel(res.modelUsed);
+    setExplainChunks(res.chunkCount);
+    saveExplainCacheEntry({
+      key: cacheKey,
+      summary: res.summary,
+      modelUsed: res.modelUsed,
+      chunkCount: res.chunkCount,
+      updatedAt: Date.now(),
+    });
+  }, [diffResult.hunksPatch, diffResult.stats, explainFocus, title, effectiveLanguage]);
 
   const loadSample = useCallback(() => {
     const preset = SAMPLE_PRESETS[0];
@@ -1325,6 +1358,7 @@ export default function App() {
           onFocusChange={setExplainFocus}
           onRunExplain={runExplain}
           onRunLocalBrowserAI={runLocalBrowserAiFallback}
+          onRunInstantSummary={runInstantOfflineSummary}
           hunksPatch={diffResult.hunksPatch}
         />
 

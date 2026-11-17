@@ -8,6 +8,7 @@ import {
   AlertCircle,
   AlertTriangle,
   Cpu,
+  Zap,
 } from 'lucide-react';
 import {
   clearLocalAiCache,
@@ -28,6 +29,7 @@ interface ExplainDrawerProps {
   onFocusChange: (focus: 'concise' | 'detailed' | 'risks') => void;
   onRunExplain: (focusOverride?: 'concise' | 'detailed' | 'risks', forceRefresh?: boolean) => void;
   onRunLocalBrowserAI?: () => void;
+  onRunInstantSummary?: () => void;
   hunksPatch: string;
 }
 
@@ -68,6 +70,7 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
   onFocusChange,
   onRunExplain,
   onRunLocalBrowserAI,
+  onRunInstantSummary,
   hunksPatch,
 }) => {
   const [copiedPrompt, setCopiedPrompt] = useState(false);
@@ -139,19 +142,33 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
           ))}
         </div>
 
-        <button
-          type="button"
-          onClick={() => onRunExplain(undefined, true)}
-          disabled={loading}
-          className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded border border-[var(--border-hairline)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
-        >
-          <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
-          <span>Refresh</span>
-        </button>
+        <div className="flex items-center gap-1.5">
+          {onRunInstantSummary && hunksPatch && (
+            <button
+              type="button"
+              onClick={onRunInstantSummary}
+              disabled={loading}
+              title="Instant offline structural & symbol summary (0 ms, no model download)"
+              className="inline-flex items-center gap-1 px-2 py-1 text-xs font-medium rounded border border-[var(--border-hairline)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
+            >
+              <Zap className="w-3 h-3" />
+              <span>Instant</span>
+            </button>
+          )}
+          <button
+            type="button"
+            onClick={() => onRunExplain(undefined, true)}
+            disabled={loading}
+            className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded border border-[var(--border-hairline)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
+          >
+            <RefreshCw className={`w-3 h-3 ${loading ? 'animate-spin' : ''}`} />
+            <span>Refresh</span>
+          </button>
+        </div>
       </div>
 
       <div className="diff-scroll flex-1 overflow-y-auto p-4 space-y-3 text-sm leading-relaxed text-[var(--text-primary)]/90">
-        {loading && (
+        {loading && !summary && (
           <div className="space-y-2.5 py-2">
             {loadingStatus && (
               <p className="text-xs font-mono text-[var(--text-muted)]">{loadingStatus}</p>
@@ -161,6 +178,10 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
             <div className="h-3.5 w-5/6 rounded bg-[var(--bg-hover)] animate-pulse" />
             <div className="h-3.5 w-2/3 rounded bg-[var(--bg-hover)] animate-pulse" />
           </div>
+        )}
+
+        {loading && summary && loadingStatus && (
+          <p className="text-xs font-mono text-[var(--text-muted)]">{loadingStatus}</p>
         )}
 
         {!loading && error && (
@@ -183,8 +204,8 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
                       <div className="space-y-1 min-w-0">
                         <p className="font-semibold text-[var(--text-primary)]">
                           {pendingCaps.isLowEnd
-                            ? 'Low-spec hardware or slow fallback detected'
-                            : 'Confirm local model download (~390 MB)'}
+                            ? `Confirm ${pendingCaps.modelLabel}`
+                            : `Confirm local model download (~${pendingCaps.estimatedDownloadMb} MB)`}
                         </p>
                         <div className="font-mono text-[0.6875rem] text-[var(--text-muted)] space-y-0.5">
                           <p>
@@ -201,13 +222,13 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
                             Backend:{' '}
                             {pendingCaps.hasWebGpu
                               ? pendingCaps.gpuLabel || 'WebGPU'
-                              : 'CPU WebAssembly (slower)'}
+                              : 'Web Worker WASM (non-blocking)'}
                           </p>
                           <p>
                             Cache:{' '}
                             {pendingCaps.isCached
                               ? 'Already cached (0 MB download)'
-                              : `Uncached (~390 MB)${
+                              : `Uncached (~${pendingCaps.estimatedDownloadMb} MB)${
                                   pendingCaps.freeStorageMb !== null
                                     ? ` · ${pendingCaps.freeStorageMb.toLocaleString()} MB quota free`
                                     : ''
@@ -234,7 +255,7 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
                       >
                         <Cpu className="w-3.5 h-3.5" />
                         <span>
-                          {pendingCaps.isCached ? 'Run Cached AI' : 'Download & Run Anyway'}
+                          {pendingCaps.isCached ? 'Run Cached AI' : 'Download & Run'}
                         </span>
                       </button>
                       <button
@@ -248,16 +269,26 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
                   </div>
                 ) : (
                   <div className="flex flex-wrap items-center gap-2">
+                    {onRunInstantSummary && (
+                      <button
+                        type="button"
+                        onClick={onRunInstantSummary}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-[var(--accent-fg)] font-medium cursor-pointer"
+                      >
+                        <Zap className="w-3.5 h-3.5" />
+                        <span>Instant Summary (0ms)</span>
+                      </button>
+                    )}
                     {onRunLocalBrowserAI && (
                       <button
                         type="button"
                         disabled={checkingSpecs}
                         onClick={() => void handleLocalAiRequest()}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-[var(--accent-fg)] font-medium cursor-pointer disabled:opacity-60"
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] font-medium cursor-pointer disabled:opacity-60"
                       >
                         <Cpu className="w-3.5 h-3.5" />
                         <span>
-                          {checkingSpecs ? 'Inspecting specs...' : 'Run In-Browser AI'}
+                          {checkingSpecs ? 'Inspecting specs...' : 'Run Fast Local AI'}
                         </span>
                       </button>
                     )}
@@ -280,7 +311,7 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
           </div>
         )}
 
-        {!loading && !error && summary && (
+        {!error && summary && (
           <div className="space-y-2">
             {summary.split('\n').map((rawLine, idx) => {
               const line = rawLine.trim();
@@ -331,7 +362,7 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
                   setCacheCleared(true);
                   setTimeout(() => setCacheCleared(false), 1800);
                 }}
-                title="Delete cached Qwen2.5-0.5B weights (~390 MB) from browser storage"
+                title="Delete cached local AI weights from browser storage"
                 className="underline decoration-dotted hover:text-[var(--text-primary)] cursor-pointer"
               >
                 {cacheCleared ? 'Cache freed' : 'Free cache'}
