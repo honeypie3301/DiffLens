@@ -24,6 +24,16 @@ let cachedDevice: 'webgpu' | 'wasm' = 'wasm';
 const MODEL_ID = 'onnx-community/Qwen2.5-0.5B-Instruct';
 const CDN_URL = 'https://cdn.jsdelivr.net/npm/@huggingface/transformers@3.5.1/+esm';
 
+export async function clearLocalAiCache(): Promise<boolean> {
+  cachedGenerator = null;
+  if (typeof caches === 'undefined') return false;
+  try {
+    return await caches.delete('transformers-cache');
+  } catch {
+    return false;
+  }
+}
+
 export async function inspectDeviceCapabilities(): Promise<DeviceCapabilities> {
   const nav = navigator as unknown as {
     deviceMemory?: number;

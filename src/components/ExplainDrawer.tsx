@@ -10,6 +10,7 @@ import {
   Cpu,
 } from 'lucide-react';
 import {
+  clearLocalAiCache,
   inspectDeviceCapabilities,
   type DeviceCapabilities,
 } from '../utils/localBrowserAi';
@@ -25,7 +26,7 @@ interface ExplainDrawerProps {
   chunkCount: number;
   focus: 'concise' | 'detailed' | 'risks';
   onFocusChange: (focus: 'concise' | 'detailed' | 'risks') => void;
-  onRunExplain: (focusOverride?: 'concise' | 'detailed' | 'risks') => void;
+  onRunExplain: (focusOverride?: 'concise' | 'detailed' | 'risks', forceRefresh?: boolean) => void;
   onRunLocalBrowserAI?: () => void;
   hunksPatch: string;
 }
@@ -70,6 +71,7 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
   hunksPatch,
 }) => {
   const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [cacheCleared, setCacheCleared] = useState(false);
   const [checkingSpecs, setCheckingSpecs] = useState(false);
   const [pendingCaps, setPendingCaps] = useState<DeviceCapabilities | null>(null);
 
@@ -139,7 +141,7 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
 
         <button
           type="button"
-          onClick={() => onRunExplain()}
+          onClick={() => onRunExplain(undefined, true)}
           disabled={loading}
           className="inline-flex items-center gap-1.5 px-2.5 py-1 text-xs font-medium rounded border border-[var(--border-hairline)] text-[var(--text-primary)] hover:bg-[var(--bg-hover)] disabled:opacity-50 transition-colors cursor-pointer whitespace-nowrap"
         >
@@ -318,11 +320,25 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
       </div>
 
       {modelUsed && !loading && !error && (
-        <div className="px-4 py-2 border-t border-[var(--border-hairline)] flex items-center justify-between text-xs font-mono tabular-nums text-[var(--text-muted)]">
+        <div className="px-4 py-2 border-t border-[var(--border-hairline)] flex items-center justify-between gap-2 text-xs font-mono tabular-nums text-[var(--text-muted)]">
           <span className="truncate">{modelUsed}</span>
-          <span className="shrink-0">
-            {chunkCount > 1 ? `${chunkCount} chunks` : 'Hunk context'}
-          </span>
+          <div className="flex items-center gap-2 shrink-0">
+            {modelUsed.startsWith('browser/') && (
+              <button
+                type="button"
+                onClick={async () => {
+                  await clearLocalAiCache();
+                  setCacheCleared(true);
+                  setTimeout(() => setCacheCleared(false), 1800);
+                }}
+                title="Delete cached Qwen2.5-0.5B weights (~390 MB) from browser storage"
+                className="underline decoration-dotted hover:text-[var(--text-primary)] cursor-pointer"
+              >
+                {cacheCleared ? 'Cache freed' : 'Free cache'}
+              </button>
+            )}
+            <span>{chunkCount > 1 ? `${chunkCount} chunks` : 'Hunk context'}</span>
+          </div>
         </div>
       )}
     </aside>

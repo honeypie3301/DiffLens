@@ -38,8 +38,46 @@ import { SavedHistoryDrawer } from './components/SavedHistoryDrawer';
 
 const STORAGE_KEY_SAVED = 'difflens.saved.v1';
 const STORAGE_KEY_PREFS = 'difflens.prefs.v3';
+const STORAGE_KEY_EXPLAIN = 'difflens.explain.v1';
 const API_BASE = ((import.meta as unknown as { env?: { VITE_API_BASE_URL?: string } }).env
   ?.VITE_API_BASE_URL || '').replace(/\/+$/, '');
+
+interface CachedExplainEntry {
+  key: string;
+  summary: string;
+  modelUsed: string;
+  chunkCount: number;
+  updatedAt: number;
+}
+
+function hashPatchKey(patch: string, focus: string): string {
+  let h = 2166136261;
+  for (let i = 0; i < patch.length; i++) {
+    h ^= patch.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return `${focus}:${patch.length}:${h >>> 0}`;
+}
+
+function loadExplainCache(): CachedExplainEntry[] {
+  try {
+    const raw = localStorage.getItem(STORAGE_KEY_EXPLAIN);
+    if (raw) return JSON.parse(raw) as CachedExplainEntry[];
+  } catch {
+    // Ignore storage read error
+  }
+  return [];
+}
+
+function saveExplainCacheEntry(entry: CachedExplainEntry): void {
+  try {
+    const existing = loadExplainCache().filter((e) => e.key !== entry.key);
+    const next = [entry, ...existing].slice(0, 20);
+    localStorage.setItem(STORAGE_KEY_EXPLAIN, JSON.stringify(next));
+  } catch {
+    // Ignore storage quota error
+  }
+}
 
 const VALID_THEMES: AppThemeId[] = ['midnight', 'sage', 'twilight', 'golden', 'alabaster'];
 
@@ -473,16 +511,55 @@ export default function App() {
     }
   }, [title, selectedLanguage, leftText, rightText]);
 
+  const currentExplainKey = useMemo(
+    () => (diffResult.hunksPatch ? hashPatchKey(diffResult.hunksPatch, explainFocus) : null),
+    [diffResult.hunksPatch, explainFocus]
+  );
+
+  // Sync displayed summary cleanly when diff changes
+  useEffect(() => {
+    if (!currentExplainKey) {
+      setExplainSummary(null);
+      setExplainModel(null);
+      setExplainError(null);
+      return;
+    }
+    const hit = loadExplainCache().find((e) => e.key === currentExplainKey);
+    if (hit) {
+      setExplainSummary(hit.summary);
+      setExplainModel(hit.modelUsed);
+      setExplainChunks(hit.chunkCount);
+      setExplainError(null);
+    } else {
+      setExplainSummary(null);
+      setExplainModel(null);
+    }
+  }, [currentExplainKey]);
+
   const runExplain = useCallback(
-    async (focusOverride?: 'concise' | 'detailed' | 'risks') => {
+    async (focusOverride?: 'concise' | 'detailed' | 'risks', forceRefresh = false) => {
       if (!diffResult.hunksPatch) {
         setExplainOpen(true);
         setExplainError('Compare two non-identical inputs first to generate an AI summary.');
         return;
       }
       const activeFocus = focusOverride ?? explainFocus;
+      const cacheKey = hashPatchKey(diffResult.hunksPatch, activeFocus);
+
       setExplainOpen(true);
       setSavedOpen(false);
+
+      if (!forceRefresh) {
+        const hit = loadExplainCache().find((e) => e.key === cacheKey);
+        if (hit) {
+          setExplainSummary(hit.summary);
+          setExplainModel(hit.modelUsed);
+          setExplainChunks(hit.chunkCount);
+          setExplainError(null);
+          return;
+        }
+      }
+
       setExplainLoading(true);
       setExplainStatus(null);
       setExplainError(null);
@@ -512,9 +589,17 @@ export default function App() {
           throw new Error(data.error || `Request failed (${res.status})`);
         }
 
+        const chunks = data.chunkCount ?? 1;
         setExplainSummary(data.summary);
         setExplainModel(data.modelUsed);
-        setExplainChunks(data.chunkCount ?? 1);
+        setExplainChunks(chunks);
+        saveExplainCacheEntry({
+          key: cacheKey,
+          summary: data.summary,
+          modelUsed: data.modelUsed,
+          chunkCount: chunks,
+          updatedAt: Date.now(),
+        });
       } catch (err: unknown) {
         const localSummary = await tryChromeBuiltInAI(
           `Focus: ${activeFocus}\nTitle: ${title}\nLanguage: ${effectiveLanguage}\n\n${diffResult.hunksPatch}`
@@ -525,6 +610,13 @@ export default function App() {
           setExplainModel('chrome-built-in-ai');
           setExplainChunks(1);
           setExplainError(null);
+          saveExplainCacheEntry({
+            key: cacheKey,
+            summary: localSummary,
+            modelUsed: 'chrome-built-in-ai',
+            chunkCount: 1,
+            updatedAt: Date.now(),
+          });
         } else {
           const msg = err instanceof Error ? err.message : 'Unable to reach AI explainer.';
           setExplainError(msg);
@@ -539,6 +631,7 @@ export default function App() {
 
   const runLocalBrowserAiFallback = useCallback(async () => {
     if (!diffResult.hunksPatch) return;
+    const cacheKey = hashPatchKey(diffResult.hunksPatch, explainFocus);
     setExplainLoading(true);
     setExplainError(null);
     setExplainStatus('Initializing in-browser AI...');
@@ -554,6 +647,13 @@ export default function App() {
       setExplainModel(res.modelUsed);
       setExplainChunks(1);
       setExplainError(null);
+      saveExplainCacheEntry({
+        key: cacheKey,
+        summary: res.summary,
+        modelUsed: res.modelUsed,
+        chunkCount: 1,
+        updatedAt: Date.now(),
+      });
     } catch (err: unknown) {
       setExplainError(
         err instanceof Error
@@ -1045,8 +1145,11 @@ export default function App() {
               <button
                 type="button"
                 onClick={() => {
-                  if (explainOpen && explainSummary) {
+                  if (explainOpen) {
                     setExplainOpen(false);
+                  } else if (explainSummary) {
+                    setSavedOpen(false);
+                    setExplainOpen(true);
                   } else {
                     void runExplain();
                   }
