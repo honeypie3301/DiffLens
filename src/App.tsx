@@ -34,7 +34,9 @@ import {
   compactDiffForLocalAi,
   generateInstantLocalSummary,
   runInBrowserLocalAI,
+  type LocalAiModelKey,
 } from './utils/localBrowserAi';
+import { copyTextToClipboard } from './utils/clipboard';
 import { VirtualDiffViewer } from './components/VirtualDiffViewer';
 import { RawInputEditor } from './components/RawInputEditor';
 import { ExplainDrawer } from './components/ExplainDrawer';
@@ -141,7 +143,7 @@ function loadPrefs(): SavedPrefs {
       const parsed = JSON.parse(raw) as Omit<Partial<SavedPrefs>, 'theme'> & { theme?: string };
       const validFont =
         typeof parsed.fontSizeRem === 'number' &&
-        parsed.fontSizeRem >= 0.6875 &&
+        parsed.fontSizeRem >= 0.125 &&
         parsed.fontSizeRem <= 1.25
           ? parsed.fontSizeRem
           : DEFAULT_PREFS.fontSizeRem;
@@ -268,6 +270,7 @@ export default function App() {
   const [explainModel, setExplainModel] = useState<string | null>(null);
   const [explainChunks, setExplainChunks] = useState<number>(1);
   const [explainFocus, setExplainFocus] = useState<'concise' | 'detailed' | 'risks'>('concise');
+  const [localModelKey, setLocalModelKey] = useState<LocalAiModelKey>('gemma3-270m');
 
   const workerRef = useRef<Worker | null>(null);
   const requestIdRef = useRef<number>(0);
@@ -297,7 +300,7 @@ export default function App() {
   const updateFontSize = useCallback(
     (delta: number) => {
       setFontSizeRem((prev) => {
-        const next = Math.round(Math.min(1.25, Math.max(0.6875, prev + delta)) * 10000) / 10000;
+        const next = Math.round(Math.min(1.25, Math.max(0.125, prev + delta)) * 10000) / 10000;
         savePrefs({
           theme,
           density,
@@ -507,9 +510,11 @@ export default function App() {
       });
       const shareUrl = `${window.location.origin}${window.location.pathname}#diff=${token}`;
       window.history.replaceState(null, '', `#diff=${token}`);
-      await navigator.clipboard?.writeText(shareUrl);
-      setShareCopied(true);
-      setTimeout(() => setShareCopied(false), 1800);
+      const copied = await copyTextToClipboard(shareUrl);
+      if (copied) {
+        setShareCopied(true);
+        setTimeout(() => setShareCopied(false), 1800);
+      }
     } catch {
       // Ignore clipboard failure
     }
@@ -634,45 +639,50 @@ export default function App() {
     [explainFocus, title, effectiveLanguage, diffResult.hunksPatch, diffResult.stats]
   );
 
-  const runLocalBrowserAiFallback = useCallback(async () => {
-    if (!diffResult.hunksPatch) return;
-    const cacheKey = hashPatchKey(diffResult.hunksPatch, explainFocus);
-    setExplainLoading(true);
-    setExplainError(null);
-    setExplainSummary(null);
-    setExplainStatus('Initializing in-browser AI worker...');
-    try {
-      const res = await runInBrowserLocalAI(
-        diffResult.hunksPatch,
-        explainFocus,
-        title,
-        effectiveLanguage,
-        (statusText) => setExplainStatus(statusText),
-        (partialText) => setExplainSummary(partialText)
-      );
-      setExplainSummary(res.summary);
-      setExplainModel(res.modelUsed);
-      setExplainChunks(1);
+  const runLocalBrowserAiFallback = useCallback(
+    async (modelOverride?: LocalAiModelKey) => {
+      if (!diffResult.hunksPatch) return;
+      const selectedModel = modelOverride ?? localModelKey;
+      const cacheKey = hashPatchKey(diffResult.hunksPatch, `${explainFocus}:${selectedModel}`);
+      setExplainLoading(true);
       setExplainError(null);
-      saveExplainCacheEntry({
-        key: cacheKey,
-        summary: res.summary,
-        modelUsed: res.modelUsed,
-        chunkCount: 1,
-        updatedAt: Date.now(),
-      });
-    } catch (err: unknown) {
       setExplainSummary(null);
-      setExplainError(
-        err instanceof Error
-          ? `In-browser AI failed to initialize: ${err.message}`
-          : 'In-browser AI failed to initialize.'
-      );
-    } finally {
-      setExplainLoading(false);
-      setExplainStatus(null);
-    }
-  }, [diffResult.hunksPatch, explainFocus, title, effectiveLanguage]);
+      setExplainStatus('Initializing in-browser AI worker...');
+      try {
+        const res = await runInBrowserLocalAI(
+          diffResult.hunksPatch,
+          explainFocus,
+          title,
+          effectiveLanguage,
+          selectedModel,
+          (statusText) => setExplainStatus(statusText),
+          (partialText) => setExplainSummary(partialText)
+        );
+        setExplainSummary(res.summary);
+        setExplainModel(res.modelUsed);
+        setExplainChunks(1);
+        setExplainError(null);
+        saveExplainCacheEntry({
+          key: cacheKey,
+          summary: res.summary,
+          modelUsed: res.modelUsed,
+          chunkCount: 1,
+          updatedAt: Date.now(),
+        });
+      } catch (err: unknown) {
+        setExplainSummary(null);
+        setExplainError(
+          err instanceof Error
+            ? `In-browser AI failed to initialize: ${err.message}`
+            : 'In-browser AI failed to initialize.'
+        );
+      } finally {
+        setExplainLoading(false);
+        setExplainStatus(null);
+      }
+    },
+    [diffResult.hunksPatch, explainFocus, localModelKey, title, effectiveLanguage]
+  );
 
   const runInstantOfflineSummary = useCallback(() => {
     if (!diffResult.hunksPatch) return;
@@ -1359,6 +1369,8 @@ export default function App() {
           onRunExplain={runExplain}
           onRunLocalBrowserAI={runLocalBrowserAiFallback}
           onRunInstantSummary={runInstantOfflineSummary}
+          localModelKey={localModelKey}
+          onLocalModelChange={setLocalModelKey}
           hunksPatch={diffResult.hunksPatch}
         />
 

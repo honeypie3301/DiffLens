@@ -12,9 +12,13 @@ import {
 } from 'lucide-react';
 import {
   clearLocalAiCache,
+  compactDiffForLocalAi,
   inspectDeviceCapabilities,
+  LOCAL_AI_MODELS,
   type DeviceCapabilities,
+  type LocalAiModelKey,
 } from '../utils/localBrowserAi';
+import { copyTextToClipboard } from '../utils/clipboard';
 
 interface ExplainDrawerProps {
   open: boolean;
@@ -28,13 +32,16 @@ interface ExplainDrawerProps {
   focus: 'concise' | 'detailed' | 'risks';
   onFocusChange: (focus: 'concise' | 'detailed' | 'risks') => void;
   onRunExplain: (focusOverride?: 'concise' | 'detailed' | 'risks', forceRefresh?: boolean) => void;
-  onRunLocalBrowserAI?: () => void;
+  onRunLocalBrowserAI?: (modelKey: LocalAiModelKey) => void;
   onRunInstantSummary?: () => void;
+  localModelKey: LocalAiModelKey;
+  onLocalModelChange: (modelKey: LocalAiModelKey) => void;
   hunksPatch: string;
 }
 
-function renderInlineCode(line: string): React.ReactNode {
-  const parts = line.split(/(`[^`]+`|\*\*[^*]+\*\*)/g);
+function renderInlineCode(line: string, allowBold = true): React.ReactNode {
+  const pattern = allowBold ? /(`[^`]+`|\*\*[^*]+\*\*)/g : /(`[^`]+`)/g;
+  const parts = line.split(pattern);
   return parts.map((part, idx) => {
     if (part.startsWith('`') && part.endsWith('`') && part.length > 2) {
       return (
@@ -46,10 +53,10 @@ function renderInlineCode(line: string): React.ReactNode {
         </code>
       );
     }
-    if (part.startsWith('**') && part.endsWith('**') && part.length > 4) {
+    if (allowBold && part.startsWith('**') && part.endsWith('**') && part.length > 4) {
       return (
         <strong key={idx} className="font-semibold text-[var(--text-primary)]">
-          {part.slice(2, -2)}
+          {renderInlineCode(part.slice(2, -2), false)}
         </strong>
       );
     }
@@ -71,32 +78,46 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
   onRunExplain,
   onRunLocalBrowserAI,
   onRunInstantSummary,
+  localModelKey,
+  onLocalModelChange,
   hunksPatch,
 }) => {
   const [copiedPrompt, setCopiedPrompt] = useState(false);
+  const [copyFailed, setCopyFailed] = useState(false);
   const [cacheCleared, setCacheCleared] = useState(false);
   const [checkingSpecs, setCheckingSpecs] = useState(false);
   const [pendingCaps, setPendingCaps] = useState<DeviceCapabilities | null>(null);
 
   if (!open) return null;
 
-  const handleCopyPrompt = () => {
-    const prompt = `Explain the following diff hunks concisely:\n\n${hunksPatch}`;
-    navigator.clipboard?.writeText(prompt).catch(() => {});
-    setCopiedPrompt(true);
-    setTimeout(() => setCopiedPrompt(false), 1600);
+  const handleCopyPrompt = async () => {
+    const patchForPrompt =
+      hunksPatch.length > 64_000
+        ? compactDiffForLocalAi(hunksPatch, 36_000).compacted
+        : hunksPatch;
+    const prompt = `Explain the following diff hunks concisely:\n\n${patchForPrompt}`;
+    const ok = await copyTextToClipboard(prompt);
+    if (ok) {
+      setCopyFailed(false);
+      setCopiedPrompt(true);
+      setTimeout(() => setCopiedPrompt(false), 1800);
+    } else {
+      setCopyFailed(true);
+      setTimeout(() => setCopyFailed(false), 2000);
+    }
   };
 
-  const handleLocalAiRequest = async () => {
+  const handleLocalAiRequest = async (overrideKey?: LocalAiModelKey) => {
     if (!onRunLocalBrowserAI) return;
+    const targetKey = overrideKey ?? localModelKey;
     setCheckingSpecs(true);
     try {
-      const caps = await inspectDeviceCapabilities();
+      const caps = await inspectDeviceCapabilities(targetKey);
       if (caps.isLowEnd || !caps.isCached) {
         setPendingCaps(caps);
         return;
       }
-      onRunLocalBrowserAI();
+      onRunLocalBrowserAI(targetKey);
     } finally {
       setCheckingSpecs(false);
     }
@@ -249,7 +270,7 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
                         type="button"
                         onClick={() => {
                           setPendingCaps(null);
-                          onRunLocalBrowserAI?.();
+                          onRunLocalBrowserAI?.(localModelKey);
                         }}
                         className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-[var(--accent-fg)] font-medium cursor-pointer"
                       >
@@ -268,42 +289,76 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
                     </div>
                   </div>
                 ) : (
-                  <div className="flex flex-wrap items-center gap-2">
-                    {onRunInstantSummary && (
-                      <button
-                        type="button"
-                        onClick={onRunInstantSummary}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-[var(--accent-fg)] font-medium cursor-pointer"
-                      >
-                        <Zap className="w-3.5 h-3.5" />
-                        <span>Instant Summary (0ms)</span>
-                      </button>
-                    )}
+                  <div className="space-y-2.5">
                     {onRunLocalBrowserAI && (
+                      <div className="space-y-1">
+                        <label
+                          htmlFor="local-ai-model-select"
+                          className="block text-[0.6875rem] font-medium text-[var(--text-muted)]"
+                        >
+                          Browser AI Model
+                        </label>
+                        <select
+                          id="local-ai-model-select"
+                          value={localModelKey}
+                          onChange={(e) => {
+                            const next = e.target.value as LocalAiModelKey;
+                            onLocalModelChange(next);
+                            setPendingCaps(null);
+                          }}
+                          className="w-full px-2 py-1.5 rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] text-xs text-[var(--text-primary)] focus:outline-none focus:border-[var(--accent)] cursor-pointer"
+                        >
+                          {LOCAL_AI_MODELS.map((m) => (
+                            <option key={m.key} value={m.key}>
+                              {m.label} · {m.badge} (~{m.estimatedMb} MB)
+                            </option>
+                          ))}
+                        </select>
+                      </div>
+                    )}
+                    <div className="flex flex-wrap items-center gap-2">
+                      {onRunInstantSummary && (
+                        <button
+                          type="button"
+                          onClick={onRunInstantSummary}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded bg-[var(--accent)] hover:bg-[var(--accent-hover)] text-[var(--accent-fg)] font-medium cursor-pointer"
+                        >
+                          <Zap className="w-3.5 h-3.5" />
+                          <span>Instant Summary (0ms)</span>
+                        </button>
+                      )}
+                      {onRunLocalBrowserAI && (
+                        <button
+                          type="button"
+                          disabled={checkingSpecs}
+                          onClick={() => void handleLocalAiRequest()}
+                          className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] font-medium cursor-pointer disabled:opacity-60"
+                        >
+                          <Cpu className="w-3.5 h-3.5" />
+                          <span>
+                            {checkingSpecs ? 'Inspecting specs...' : 'Run Local AI'}
+                          </span>
+                        </button>
+                      )}
                       <button
                         type="button"
-                        disabled={checkingSpecs}
-                        onClick={() => void handleLocalAiRequest()}
-                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] font-medium cursor-pointer disabled:opacity-60"
+                        onClick={() => void handleCopyPrompt()}
+                        className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] font-medium cursor-pointer"
                       >
-                        <Cpu className="w-3.5 h-3.5" />
+                        {copiedPrompt ? (
+                          <Check className="w-3.5 h-3.5 text-[var(--add-fg)]" />
+                        ) : (
+                          <Copy className="w-3.5 h-3.5" />
+                        )}
                         <span>
-                          {checkingSpecs ? 'Inspecting specs...' : 'Run Fast Local AI'}
+                          {copiedPrompt
+                            ? 'Copied Hunk Prompt'
+                            : copyFailed
+                            ? 'Clipboard blocked'
+                            : 'Copy Hunk Prompt'}
                         </span>
                       </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={handleCopyPrompt}
-                      className="inline-flex items-center gap-1.5 px-2.5 py-1.5 rounded border border-[var(--border-strong)] bg-[var(--bg-surface)] hover:bg-[var(--bg-hover)] text-[var(--text-primary)] font-medium cursor-pointer"
-                    >
-                      {copiedPrompt ? (
-                        <Check className="w-3.5 h-3.5" />
-                      ) : (
-                        <Copy className="w-3.5 h-3.5" />
-                      )}
-                      <span>{copiedPrompt ? 'Copied Hunk Prompt' : 'Copy Hunk Prompt'}</span>
-                    </button>
+                    </div>
                   </div>
                 )}
               </div>
@@ -317,13 +372,18 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
               const line = rawLine.trim();
               if (!line) return <div key={idx} className="h-1" />;
 
-              if (line.startsWith('### ') || line.startsWith('## ') || line.startsWith('# ')) {
-                const heading = line.replace(/^#+\s*/, '');
+              const headingMatch = line.match(/^(#{1,6})\s+(.+)$/);
+              if (headingMatch) {
+                const level = headingMatch[1].length;
+                const heading = headingMatch[2];
+                const headingClass =
+                  level <= 2
+                    ? 'pt-2.5 text-sm font-semibold tracking-wide text-[var(--text-primary)]'
+                    : level === 3
+                    ? 'pt-2 text-[0.8125rem] font-semibold tracking-wide text-[var(--text-primary)]'
+                    : 'pt-1.5 text-xs font-semibold tracking-wide text-[var(--text-primary)]';
                 return (
-                  <h3
-                    key={idx}
-                    className="pt-2 text-xs font-semibold tracking-wide text-[var(--text-primary)]"
-                  >
+                  <h3 key={idx} className={headingClass}>
                     {renderInlineCode(heading)}
                   </h3>
                 );
@@ -335,6 +395,20 @@ export const ExplainDrawer: React.FC<ExplainDrawerProps> = ({
                     <span className="mt-2 w-1 h-1 rounded-full bg-[var(--text-muted)] shrink-0" />
                     <p className="text-xs sm:text-[0.8125rem] leading-relaxed">
                       {renderInlineCode(line.slice(2))}
+                    </p>
+                  </div>
+                );
+              }
+
+              const orderedMatch = line.match(/^(\d+\.)\s+(.+)$/);
+              if (orderedMatch) {
+                return (
+                  <div key={idx} className="flex items-start gap-2 pl-1">
+                    <span className="text-xs font-mono text-[var(--text-muted)] shrink-0 mt-0.5">
+                      {orderedMatch[1]}
+                    </span>
+                    <p className="text-xs sm:text-[0.8125rem] leading-relaxed">
+                      {renderInlineCode(orderedMatch[2])}
                     </p>
                   </div>
                 );

@@ -1,9 +1,103 @@
 import type { DiffStats } from '../types/diff';
 
+export type LocalAiModelKey =
+  | 'gemma3-270m'
+  | 'lamini-t5-248m'
+  | 'smollm2-360m'
+  | 'smollm2-135m'
+  | 'qwen3-0.6b';
+
+export interface LocalAiModelSpec {
+  key: LocalAiModelKey;
+  label: string;
+  badge: string;
+  modelId: string;
+  task: 'text-generation' | 'text2text-generation';
+  wasmDtype: 'q4' | 'int8';
+  webgpuDtype: 'q4' | 'q4f16' | 'int8';
+  estimatedMb: number;
+  preferWasm: boolean;
+  cacheMatch: string;
+  description: string;
+}
+
+export const LOCAL_AI_MODELS: LocalAiModelSpec[] = [
+  {
+    key: 'gemma3-270m',
+    label: 'Gemma 3 270M',
+    badge: 'Balanced',
+    modelId: 'onnx-community/gemma-3-270m-it-ONNX',
+    task: 'text-generation',
+    wasmDtype: 'q4',
+    webgpuDtype: 'q4',
+    estimatedMb: 307,
+    preferWasm: false,
+    cacheMatch: 'gemma-3-270m',
+    description: 'Google Gemma 3 compact instruct model for clear diff summaries.',
+  },
+  {
+    key: 'lamini-t5-248m',
+    label: 'LaMini-Flan-T5 248M',
+    badge: 'Fast CPU',
+    modelId: 'Xenova/LaMini-Flan-T5-248M',
+    task: 'text2text-generation',
+    wasmDtype: 'int8',
+    webgpuDtype: 'int8',
+    estimatedMb: 246,
+    preferWasm: true,
+    cacheMatch: 'LaMini-Flan-T5-248M',
+    description: 'Encoder-decoder T5 model; fast single-pass encoding on CPU WASM.',
+  },
+  {
+    key: 'smollm2-135m',
+    label: 'SmolLM2 135M',
+    badge: 'Lightest',
+    modelId: 'onnx-community/SmolLM2-135M-Instruct-ONNX',
+    task: 'text-generation',
+    wasmDtype: 'q4',
+    webgpuDtype: 'q4',
+    estimatedMb: 172,
+    preferWasm: false,
+    cacheMatch: 'SmolLM2-135M',
+    description: 'Smallest download (~172 MB) for quick summaries on low-memory devices.',
+  },
+  {
+    key: 'smollm2-360m',
+    label: 'SmolLM2 360M',
+    badge: 'Compact',
+    modelId: 'onnx-community/SmolLM2-360M-Instruct-ONNX',
+    task: 'text-generation',
+    wasmDtype: 'q4',
+    webgpuDtype: 'q4',
+    estimatedMb: 368,
+    preferWasm: false,
+    cacheMatch: 'SmolLM2-360M',
+    description: 'Stronger SmolLM2 variant for multi-hunk explanations.',
+  },
+  {
+    key: 'qwen3-0.6b',
+    label: 'Qwen3 0.6B',
+    badge: 'Best Code',
+    modelId: 'onnx-community/Qwen3-0.6B-ONNX',
+    task: 'text-generation',
+    wasmDtype: 'int8',
+    webgpuDtype: 'q4f16',
+    estimatedMb: 590,
+    preferWasm: false,
+    cacheMatch: 'Qwen3-0.6B',
+    description: 'Best local code reasoning (recommended with WebGPU).',
+  },
+];
+
+export function getLocalAiModelSpec(key: LocalAiModelKey): LocalAiModelSpec {
+  return LOCAL_AI_MODELS.find((m) => m.key === key) ?? LOCAL_AI_MODELS[0];
+}
+
 export interface DeviceCapabilities {
   deviceMemoryGb: number | null;
   cpuCores: number | null;
   hasWebGpu: boolean;
+  hasShaderF16: boolean;
   gpuLabel: string | null;
   freeStorageMb: number | null;
   saveData: boolean;
@@ -15,9 +109,6 @@ export interface DeviceCapabilities {
   modelLabel: string;
   estimatedDownloadMb: number;
 }
-
-const MODEL_WASM = 'onnx-community/SmolLM2-135M-Instruct-ONNX';
-const MODEL_WEBGPU = 'onnx-community/SmolLM2-360M-Instruct-ONNX';
 
 let aiWorker: Worker | null = null;
 let aiRequestSeq = 0;
@@ -263,12 +354,16 @@ export function generateInstantLocalSummary(params: {
   };
 }
 
-export async function inspectDeviceCapabilities(): Promise<DeviceCapabilities> {
+export async function inspectDeviceCapabilities(
+  modelKey: LocalAiModelKey = 'gemma3-270m'
+): Promise<DeviceCapabilities> {
+  const spec = getLocalAiModelSpec(modelKey);
   const nav = navigator as unknown as {
     deviceMemory?: number;
     hardwareConcurrency?: number;
     gpu?: {
       requestAdapter?: () => Promise<{
+        features?: { has?: (name: string) => boolean };
         info?: { description?: string; vendor?: string; architecture?: string };
       } | null>;
     };
@@ -287,12 +382,14 @@ export async function inspectDeviceCapabilities(): Promise<DeviceCapabilities> {
   const effectiveConnection = nav.connection?.effectiveType ?? null;
 
   let hasWebGpu = false;
+  let hasShaderF16 = false;
   let gpuLabel: string | null = null;
   try {
     if (nav.gpu?.requestAdapter) {
       const adapter = await nav.gpu.requestAdapter();
       if (adapter) {
         hasWebGpu = true;
+        hasShaderF16 = Boolean(adapter.features?.has?.('shader-f16'));
         const info = adapter.info;
         const parts = [info?.vendor, info?.description || info?.architecture].filter(Boolean);
         gpuLabel = parts.length > 0 ? parts.join(' ') : 'WebGPU GPU adapter';
@@ -302,9 +399,8 @@ export async function inspectDeviceCapabilities(): Promise<DeviceCapabilities> {
     hasWebGpu = false;
   }
 
-  const modelId = hasWebGpu ? MODEL_WEBGPU : MODEL_WASM;
-  const modelLabel = hasWebGpu ? 'SmolLM2-360M (WebGPU)' : 'SmolLM2-135M (CPU WASM)';
-  const estimatedDownloadMb = hasWebGpu ? 220 : 95;
+  const useWebGpu = hasWebGpu && !spec.preferWasm;
+  const estimatedDownloadMb = spec.estimatedMb;
 
   let freeStorageMb: number | null = null;
   try {
@@ -324,9 +420,8 @@ export async function inspectDeviceCapabilities(): Promise<DeviceCapabilities> {
     try {
       const cache = await caches.open('transformers-cache');
       const keys = await cache.keys();
-      const targetName = hasWebGpu ? 'SmolLM2-360M' : 'SmolLM2-135M';
       isCached = keys.some(
-        (req) => req.url.includes(targetName) && req.url.includes('.onnx')
+        (req) => req.url.includes(spec.cacheMatch) && req.url.includes('.onnx')
       );
     } catch {
       isCached = false;
@@ -337,11 +432,11 @@ export async function inspectDeviceCapabilities(): Promise<DeviceCapabilities> {
   if (deviceMemoryGb !== null && deviceMemoryGb <= 2) {
     warnings.push(`Limited system memory (${deviceMemoryGb} GB reported).`);
   }
-  if (cpuCores !== null && cpuCores < 4 && !hasWebGpu) {
+  if (cpuCores !== null && cpuCores < 4 && !useWebGpu) {
     warnings.push(`Low CPU core count (${cpuCores} cores) without GPU acceleration.`);
   }
-  if (!hasWebGpu) {
-    warnings.push('WebGPU unavailable — running lighter SmolLM2-135M via Web Worker WASM.');
+  if (!useWebGpu && !spec.preferWasm) {
+    warnings.push('WebGPU unavailable — running in Web Worker CPU WASM (auto-fallback).');
   }
   if (!isCached && freeStorageMb !== null && freeStorageMb < estimatedDownloadMb + 120) {
     warnings.push(`Low browser cache quota (~${freeStorageMb} MB free; ~${estimatedDownloadMb} MB required).`);
@@ -361,7 +456,8 @@ export async function inspectDeviceCapabilities(): Promise<DeviceCapabilities> {
   return {
     deviceMemoryGb,
     cpuCores,
-    hasWebGpu,
+    hasWebGpu: useWebGpu,
+    hasShaderF16,
     gpuLabel,
     freeStorageMb,
     saveData,
@@ -369,8 +465,8 @@ export async function inspectDeviceCapabilities(): Promise<DeviceCapabilities> {
     isCached,
     isLowEnd: warnings.length > 0,
     warnings,
-    modelId,
-    modelLabel,
+    modelId: spec.modelId,
+    modelLabel: `${spec.label} (${useWebGpu ? 'WebGPU' : 'WASM'})`,
     estimatedDownloadMb,
   };
 }
@@ -380,12 +476,17 @@ export async function runInBrowserLocalAI(
   focus: 'concise' | 'detailed' | 'risks',
   title: string,
   language: string,
+  modelKey: LocalAiModelKey = 'gemma3-270m',
   onProgress?: (statusText: string) => void,
   onStreamChunk?: (partialText: string) => void
 ): Promise<{ summary: string; modelUsed: string }> {
-  const caps = await inspectDeviceCapabilities();
+  const spec = getLocalAiModelSpec(modelKey);
+  const caps = await inspectDeviceCapabilities(modelKey);
   const device: 'webgpu' | 'wasm' = caps.hasWebGpu ? 'webgpu' : 'wasm';
-  const dtype: 'q4' | 'q4f16' = caps.hasWebGpu ? 'q4f16' : 'q4';
+  let dtype: 'q4' | 'q4f16' | 'int8' = device === 'webgpu' ? spec.webgpuDtype : spec.wasmDtype;
+  if (dtype === 'q4f16' && !caps.hasShaderF16) {
+    dtype = 'q4';
+  }
 
   const { compacted } = compactDiffForLocalAi(hunksPatch, 1600);
 
@@ -397,7 +498,8 @@ export async function runInBrowserLocalAI(
       : 'Summarize the main changes in 3-5 short bullet points.';
 
   const systemPrompt = `You are a senior engineer reviewing a code diff. ${focusDirective} Cite exact symbol names.`;
-  const prompt = `Title: ${title || 'Untitled'}\nLanguage: ${language}\n\n${compacted}`;
+  const thinkSuffix = modelKey === 'qwen3-0.6b' ? '\n/no_think' : '';
+  const prompt = `Title: ${title || 'Untitled'}\nLanguage: ${language}\n\n${compacted}${thinkSuffix}`;
 
   const worker = getAiWorker();
   const requestId = ++aiRequestSeq;
@@ -446,9 +548,10 @@ export async function runInBrowserLocalAI(
     worker.postMessage({
       type: 'run',
       id: requestId,
+      task: spec.task,
       prompt,
       systemPrompt,
-      modelId: caps.modelId,
+      modelId: spec.modelId,
       device,
       dtype,
     });

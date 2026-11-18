@@ -8,6 +8,7 @@ import type {
   UnifiedRow,
 } from '../types/diff';
 import { DiffLineContent } from './DiffLineContent';
+import { copyTextToClipboard } from '../utils/clipboard';
 
 interface VirtualDiffViewerProps {
   diff: DiffResult;
@@ -466,9 +467,11 @@ export const VirtualDiffViewer: React.FC<VirtualDiffViewerProps> = ({
   }, [isDraggingMinimap, handleMinimapJump]);
 
   const handleCopyLine = useCallback((key: string, text: string) => {
-    navigator.clipboard?.writeText(text).catch(() => {});
-    setCopiedLineKey(key);
-    setTimeout(() => setCopiedLineKey((prev) => (prev === key ? null : prev)), 1200);
+    void copyTextToClipboard(text).then((ok) => {
+      if (!ok) return;
+      setCopiedLineKey(key);
+      setTimeout(() => setCopiedLineKey((prev) => (prev === key ? null : prev)), 1200);
+    });
   }, []);
 
   const expandFold = useCallback((foldId: string) => {
