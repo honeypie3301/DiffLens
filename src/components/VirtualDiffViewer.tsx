@@ -1,5 +1,4 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { ChevronsUpDown, Copy, Check } from 'lucide-react';
 import type {
   DensityMode,
   DiffResult,
@@ -7,8 +6,8 @@ import type {
   SplitRow,
   UnifiedRow,
 } from '../types/diff';
-import { DiffLineContent } from './DiffLineContent';
 import { copyTextToClipboard } from '../utils/clipboard';
+import { renderDiffLineHtml } from '../utils/diffLineRenderer';
 
 interface VirtualDiffViewerProps {
   diff: DiffResult;
@@ -31,7 +30,14 @@ type DisplayItem<T> =
 
 const FOLD_CONTEXT = 3;
 const MIN_FOLD_GAP = 8;
-const OVERSCAN_ROWS = 6;
+const OVERSCAN_ROWS = 10;
+
+const CHEVRONS_UP_DOWN_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3.5 h-3.5"><path d="m7 15 5 5 5-5"/><path d="m7 9 5-5 5 5"/></svg>';
+const COPY_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3"><rect width="14" height="14" x="8" y="8" rx="2" ry="2"/><path d="M4 16c-1.1 0-2-.9-2-2V4c0-1.1.9-2 2-2h10c1.1 0 2 .9 2 2"/></svg>';
+const CHECK_SVG =
+  '<svg xmlns="http://www.w3.org/2000/svg" width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" class="w-3 h-3 text-[var(--add-fg)]"><path d="M20 6 9 17l-5-5"/></svg>';
 
 function buildFoldedItems<T extends { kind: string }>(
   rows: T[],
@@ -137,6 +143,401 @@ function findWindowBounds(
   return { startIdx: start, endIdx: end };
 }
 
+interface SplitRowSlot {
+  kind: 'row';
+  el: HTMLDivElement;
+  gutterEl: HTMLDivElement;
+  codeWrapEl: HTMLDivElement;
+  codeEl: HTMLSpanElement;
+  copyBtnEl: HTMLButtonElement;
+}
+
+interface UnifiedRowSlot {
+  kind: 'row';
+  el: HTMLDivElement;
+  leftGutterEl: HTMLDivElement;
+  rightGutterEl: HTMLDivElement;
+  signEl: HTMLDivElement;
+  codeWrapEl: HTMLDivElement;
+  codeEl: HTMLSpanElement;
+  copyBtnEl: HTMLButtonElement;
+}
+
+interface FoldSlot {
+  kind: 'fold';
+  el: HTMLDivElement;
+  btnEl: HTMLButtonElement;
+  labelEl: HTMLSpanElement;
+}
+
+type AnySlot = SplitRowSlot | UnifiedRowSlot | FoldSlot;
+
+interface RenderContext {
+  mode: 'left' | 'right' | 'unified';
+  displayItems: DisplayItem<SplitRow | UnifiedRow>[];
+  offsets: Float64Array;
+  language: string;
+  wordWrap: boolean;
+  fontSizeRem: number;
+  lineHeightPx: number;
+  searchQuery: string;
+  activeHunkIndex: number | null;
+  expandedLongLines: Set<string>;
+  epoch: number;
+}
+
+class DomRowPool {
+  private container: HTMLDivElement | null = null;
+  private active = new Map<number, AnySlot>();
+  private freeRows: Array<SplitRowSlot | UnifiedRowSlot> = [];
+  private freeFolds: FoldSlot[] = [];
+  private lastStart = -1;
+  private lastEnd = -1;
+  private lastEpoch = -1;
+
+  attach(container: HTMLDivElement | null) {
+    if (this.container === container) return;
+    this.clearAll();
+    this.container = container;
+  }
+
+  clearAll() {
+    for (const slot of this.active.values()) {
+      slot.el.remove();
+    }
+    for (const slot of this.freeRows) {
+      slot.el.remove();
+    }
+    for (const slot of this.freeFolds) {
+      slot.el.remove();
+    }
+    this.active.clear();
+    this.freeRows.length = 0;
+    this.freeFolds.length = 0;
+    this.lastStart = -1;
+    this.lastEnd = -1;
+    this.lastEpoch = -1;
+  }
+
+  private releaseAllActive() {
+    for (const slot of this.active.values()) {
+      slot.el.style.display = 'none';
+      if (slot.kind === 'fold') {
+        this.freeFolds.push(slot);
+      } else {
+        this.freeRows.push(slot);
+      }
+    }
+    this.active.clear();
+  }
+
+  private acquireFoldSlot(): FoldSlot {
+    const recycled = this.freeFolds.pop();
+    if (recycled) return recycled;
+
+    const el = document.createElement('div');
+    el.style.position = 'absolute';
+    el.style.top = '0';
+    el.style.left = '0';
+    el.style.right = '0';
+    el.className =
+      'diff-row-contain flex items-center justify-center bg-[var(--bg-subtle)] border-y border-[var(--border-hairline)] text-xs';
+
+    const btnEl = document.createElement('button');
+    btnEl.type = 'button';
+    btnEl.className =
+      'inline-flex items-center gap-1.5 px-3 py-0.5 rounded text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors cursor-pointer whitespace-nowrap';
+    btnEl.innerHTML = CHEVRONS_UP_DOWN_SVG;
+
+    const labelEl = document.createElement('span');
+    labelEl.className = 'font-mono tabular-nums';
+    btnEl.appendChild(labelEl);
+    el.appendChild(btnEl);
+
+    this.container?.appendChild(el);
+    return { kind: 'fold', el, btnEl, labelEl };
+  }
+
+  private acquireRowSlot(mode: 'left' | 'right' | 'unified'): SplitRowSlot | UnifiedRowSlot {
+    const recycled = this.freeRows.pop();
+    if (recycled) return recycled;
+
+    const el = document.createElement('div');
+    el.style.position = 'absolute';
+    el.style.top = '0';
+    el.style.left = '0';
+    el.style.right = '0';
+
+    if (mode === 'unified') {
+      const leftGutterEl = document.createElement('div');
+      leftGutterEl.className =
+        'w-[2.25rem] sm:w-[2.85rem] shrink-0 px-1.5 sm:px-2 text-right select-none tabular-nums border-r border-[var(--border-hairline)] bg-[var(--bg-subtle)] text-[var(--text-faint)]';
+
+      const rightGutterEl = document.createElement('div');
+      rightGutterEl.className =
+        'w-[2.25rem] sm:w-[2.85rem] shrink-0 px-1.5 sm:px-2 text-right select-none tabular-nums border-r border-[var(--border-hairline)] bg-[var(--bg-subtle)] text-[var(--text-faint)]';
+
+      const signEl = document.createElement('div');
+      signEl.className =
+        'w-[1.25rem] sm:w-[1.5rem] shrink-0 text-center select-none font-semibold';
+
+      const codeWrapEl = document.createElement('div');
+      const codeEl = document.createElement('span');
+
+      const copyBtnEl = document.createElement('button');
+      copyBtnEl.type = 'button';
+      copyBtnEl.title = 'Copy line';
+      copyBtnEl.className =
+        'opacity-0 group-hover:opacity-100 focus:opacity-100 absolute right-2 top-0.5 p-0.5 rounded bg-[var(--bg-elevated)] text-[var(--text-primary)] transition-opacity cursor-pointer';
+      copyBtnEl.innerHTML = COPY_SVG;
+
+      codeWrapEl.appendChild(codeEl);
+      codeWrapEl.appendChild(copyBtnEl);
+      el.appendChild(leftGutterEl);
+      el.appendChild(rightGutterEl);
+      el.appendChild(signEl);
+      el.appendChild(codeWrapEl);
+
+      this.container?.appendChild(el);
+      return {
+        kind: 'row',
+        el,
+        leftGutterEl,
+        rightGutterEl,
+        signEl,
+        codeWrapEl,
+        codeEl,
+        copyBtnEl,
+      };
+    }
+
+    const gutterEl = document.createElement('div');
+    gutterEl.className =
+      'w-[2.25rem] sm:w-[3.25rem] shrink-0 px-1.5 sm:px-2 text-right select-none tabular-nums border-r border-[var(--border-hairline)]';
+
+    const codeWrapEl = document.createElement('div');
+    const codeEl = document.createElement('span');
+
+    const copyBtnEl = document.createElement('button');
+    copyBtnEl.type = 'button';
+    copyBtnEl.title = 'Copy line';
+    copyBtnEl.className =
+      'opacity-0 group-hover:opacity-100 focus:opacity-100 absolute right-1.5 top-0.5 p-0.5 rounded bg-[var(--bg-elevated)] text-[var(--text-primary)] transition-opacity cursor-pointer';
+    copyBtnEl.innerHTML = COPY_SVG;
+
+    codeWrapEl.appendChild(codeEl);
+    codeWrapEl.appendChild(copyBtnEl);
+    el.appendChild(gutterEl);
+    el.appendChild(codeWrapEl);
+
+    this.container?.appendChild(el);
+    return { kind: 'row', el, gutterEl, codeWrapEl, codeEl, copyBtnEl };
+  }
+
+  private renderSlot(itemIndex: number, ctx: RenderContext): AnySlot {
+    const item = ctx.displayItems[itemIndex];
+    const top = ctx.offsets[itemIndex];
+    const rowHeight = ctx.offsets[itemIndex + 1] - top;
+
+    if (item.type === 'fold') {
+      const slot = this.acquireFoldSlot();
+      slot.el.style.transform = `translate3d(0, ${top}px, 0)`;
+      slot.el.style.height = `${rowHeight}px`;
+      slot.el.style.display = 'flex';
+      slot.btnEl.dataset.foldId = item.id;
+      slot.labelEl.textContent =
+        ctx.mode === 'unified'
+          ? `Show ${item.count.toLocaleString()} unchanged lines`
+          : `Show ${item.count.toLocaleString()} lines`;
+      return slot;
+    }
+
+    const slot = this.acquireRowSlot(ctx.mode);
+    slot.el.style.transform = `translate3d(0, ${top}px, 0)`;
+    slot.el.style.height = `${rowHeight}px`;
+    slot.el.style.fontSize = `${ctx.fontSizeRem}rem`;
+    slot.el.style.lineHeight = `${ctx.lineHeightPx}px`;
+    slot.el.style.display = 'flex';
+
+    if (ctx.mode === 'unified') {
+      const uSlot = slot as UnifiedRowSlot;
+      const row = item.row as UnifiedRow;
+      const isActiveHunk = ctx.activeHunkIndex !== null && row.hunkIndex === ctx.activeHunkIndex;
+
+      uSlot.el.className = isActiveHunk
+        ? 'diff-row-contain flex font-mono group ring-1 ring-inset ring-[var(--border-strong)]'
+        : 'diff-row-contain flex font-mono group';
+      uSlot.el.style.backgroundColor =
+        row.kind === 'remove'
+          ? 'var(--remove-bg)'
+          : row.kind === 'add'
+          ? 'var(--add-bg)'
+          : '';
+
+      uSlot.leftGutterEl.textContent = row.leftNum !== null ? String(row.leftNum) : '';
+      uSlot.rightGutterEl.textContent = row.rightNum !== null ? String(row.rightNum) : '';
+
+      uSlot.signEl.style.color =
+        row.kind === 'remove'
+          ? 'var(--remove-fg)'
+          : row.kind === 'add'
+          ? 'var(--add-fg)'
+          : 'var(--text-faint)';
+      uSlot.signEl.textContent = row.kind === 'remove' ? '-' : row.kind === 'add' ? '+' : ' ';
+
+      uSlot.codeWrapEl.className = ctx.wordWrap
+        ? 'flex-1 min-w-0 pr-5 relative whitespace-pre-wrap break-all'
+        : 'flex-1 min-w-0 pr-5 relative whitespace-pre';
+
+      const rowKey = `U-${item.originalIndex}`;
+      uSlot.codeEl.innerHTML = renderDiffLineHtml({
+        text: row.text,
+        language: ctx.language,
+        segments: row.segments,
+        changeKind: row.kind,
+        searchQuery: ctx.searchQuery,
+        expanded: ctx.expandedLongLines.has(rowKey),
+        rowKey,
+      });
+
+      if (row.text) {
+        uSlot.copyBtnEl.style.display = '';
+        uSlot.copyBtnEl.dataset.copyIdx = String(itemIndex);
+        uSlot.copyBtnEl.innerHTML = COPY_SVG;
+      } else {
+        uSlot.copyBtnEl.style.display = 'none';
+        delete uSlot.copyBtnEl.dataset.copyIdx;
+      }
+      return uSlot;
+    }
+
+    const sSlot = slot as SplitRowSlot;
+    const row = item.row as SplitRow;
+    const isLeft = ctx.mode === 'left';
+    const isActiveHunk = ctx.activeHunkIndex !== null && row.hunkIndex === ctx.activeHunkIndex;
+    const lineNum = isLeft ? row.leftNum : row.rightNum;
+    const text = isLeft ? row.leftText : row.rightText;
+    const segments = isLeft ? row.leftSegments : row.rightSegments;
+
+    sSlot.el.className = isActiveHunk
+      ? 'diff-row-contain flex font-mono group ring-1 ring-inset ring-[var(--border-strong)]'
+      : 'diff-row-contain flex font-mono group';
+
+    sSlot.el.style.backgroundColor = isLeft
+      ? row.kind === 'remove' || row.kind === 'modify'
+        ? 'var(--remove-bg)'
+        : row.kind === 'add'
+        ? 'var(--bg-subtle)'
+        : ''
+      : row.kind === 'add' || row.kind === 'modify'
+      ? 'var(--add-bg)'
+      : row.kind === 'remove'
+      ? 'var(--bg-subtle)'
+      : '';
+
+    if (
+      (isLeft && (row.kind === 'remove' || row.kind === 'modify')) ||
+      (!isLeft && (row.kind === 'add' || row.kind === 'modify'))
+    ) {
+      sSlot.gutterEl.style.backgroundColor = isLeft
+        ? 'var(--remove-gutter)'
+        : 'var(--add-gutter)';
+      sSlot.gutterEl.style.color = isLeft ? 'var(--remove-fg)' : 'var(--add-fg)';
+    } else {
+      sSlot.gutterEl.style.backgroundColor = 'var(--bg-subtle)';
+      sSlot.gutterEl.style.color = 'var(--text-faint)';
+    }
+    sSlot.gutterEl.textContent = lineNum !== null ? String(lineNum) : '';
+
+    sSlot.codeWrapEl.className = ctx.wordWrap
+      ? 'flex-1 min-w-0 px-2 sm:px-3 relative whitespace-pre-wrap break-all'
+      : 'flex-1 min-w-0 px-2 sm:px-3 relative whitespace-pre';
+
+    if (lineNum !== null) {
+      const rowKey = `${ctx.mode}-${item.originalIndex}`;
+      sSlot.codeEl.innerHTML = renderDiffLineHtml({
+        text,
+        language: ctx.language,
+        segments,
+        changeKind: row.kind,
+        side: ctx.mode,
+        searchQuery: ctx.searchQuery,
+        expanded: ctx.expandedLongLines.has(rowKey),
+        rowKey,
+      });
+    } else {
+      sSlot.codeEl.innerHTML = '';
+    }
+
+    if (text) {
+      sSlot.copyBtnEl.style.display = '';
+      sSlot.copyBtnEl.dataset.copyIdx = String(itemIndex);
+      sSlot.copyBtnEl.innerHTML = COPY_SVG;
+    } else {
+      sSlot.copyBtnEl.style.display = 'none';
+      delete sSlot.copyBtnEl.dataset.copyIdx;
+    }
+
+    return sSlot;
+  }
+
+  paint(scrollTop: number, viewportHeight: number, ctx: RenderContext) {
+    if (!this.container) return;
+    const { startIdx, endIdx } = findWindowBounds(
+      ctx.offsets,
+      ctx.displayItems.length,
+      scrollTop,
+      viewportHeight
+    );
+
+    const epochChanged = ctx.epoch !== this.lastEpoch;
+    if (!epochChanged && startIdx === this.lastStart && endIdx === this.lastEnd) {
+      return;
+    }
+
+    if (epochChanged) {
+      this.releaseAllActive();
+    } else {
+      for (const [idx, slot] of this.active.entries()) {
+        if (idx < startIdx || idx > endIdx) {
+          slot.el.style.display = 'none';
+          if (slot.kind === 'fold') {
+            this.freeFolds.push(slot);
+          } else {
+            this.freeRows.push(slot);
+          }
+          this.active.delete(idx);
+        }
+      }
+    }
+
+    for (let idx = startIdx; idx <= endIdx; idx++) {
+      if (!this.active.has(idx)) {
+        const slot = this.renderSlot(idx, ctx);
+        this.active.set(idx, slot);
+      }
+    }
+
+    this.lastStart = startIdx;
+    this.lastEnd = endIdx;
+    this.lastEpoch = ctx.epoch;
+  }
+
+  repaintSingle(itemIndex: number, ctx: RenderContext) {
+    const existing = this.active.get(itemIndex);
+    if (!existing) return;
+    existing.el.style.display = 'none';
+    if (existing.kind === 'fold') {
+      this.freeFolds.push(existing);
+    } else {
+      this.freeRows.push(existing);
+    }
+    this.active.delete(itemIndex);
+    const updated = this.renderSlot(itemIndex, ctx);
+    this.active.set(itemIndex, updated);
+  }
+}
+
 export const VirtualDiffViewer: React.FC<VirtualDiffViewerProps> = ({
   diff,
   viewMode,
@@ -154,27 +555,33 @@ export const VirtualDiffViewer: React.FC<VirtualDiffViewerProps> = ({
   const unifiedScrollRef = useRef<HTMLDivElement>(null);
   const leftScrollRef = useRef<HTMLDivElement>(null);
   const rightScrollRef = useRef<HTMLDivElement>(null);
+  const leftInnerRef = useRef<HTMLDivElement>(null);
+  const rightInnerRef = useRef<HTMLDivElement>(null);
+  const unifiedInnerRef = useRef<HTMLDivElement>(null);
   const minimapCanvasRef = useRef<HTMLCanvasElement>(null);
   const thumbRef = useRef<HTMLDivElement>(null);
 
-  const syncDriverRef = useRef<'left' | 'right' | null>(null);
-  const syncUnlockRafRef = useRef<number | null>(null);
-  const leftScrollRafRef = useRef<number | null>(null);
-  const rightScrollRafRef = useRef<number | null>(null);
-  const pendingLeftTopRef = useRef(0);
-  const pendingRightTopRef = useRef(0);
+  const leftPoolRef = useRef<DomRowPool>(new DomRowPool());
+  const rightPoolRef = useRef<DomRowPool>(new DomRowPool());
+  const unifiedPoolRef = useRef<DomRowPool>(new DomRowPool());
 
-  const [leftScrollTop, setLeftScrollTop] = useState(0);
-  const [rightScrollTop, setRightScrollTop] = useState(0);
+  const suppressScrollRef = useRef<{
+    left: { top: number; left: number | null; until: number } | null;
+    right: { top: number; left: number | null; until: number } | null;
+  }>({ left: null, right: null });
+
+  const expandedLongLinesRef = useRef<Set<string>>(new Set());
+  const renderEpochRef = useRef<number>(0);
+
   const [viewportHeight, setViewportHeight] = useState(720);
   const [paneWidth, setPaneWidth] = useState(600);
   const [rootFontPx, setRootFontPx] = useState(16);
   const [expandedFolds, setExpandedFolds] = useState<Set<string>>(() => new Set());
-  const [copiedLineKey, setCopiedLineKey] = useState<string | null>(null);
   const [isDraggingMinimap, setIsDraggingMinimap] = useState(false);
 
   useEffect(() => {
     setExpandedFolds(new Set());
+    expandedLongLinesRef.current.clear();
   }, [diff]);
 
   useEffect(() => {
@@ -183,7 +590,7 @@ export const VirtualDiffViewer: React.FC<VirtualDiffViewerProps> = ({
   }, []);
 
   const fontSizePx = fontSizeRem * rootFontPx;
-  const lineHeightPx = Math.round(fontSizePx * (density === 'compact' ? 1.55 : 1.75));
+  const lineHeightPx = Math.max(2, Math.round(fontSizePx * (density === 'compact' ? 1.55 : 1.75)));
   const foldRowHeight = Math.round(rootFontPx * 1.75);
 
   const displayItems = useMemo(() => {
@@ -264,85 +671,179 @@ export const VirtualDiffViewer: React.FC<VirtualDiffViewerProps> = ({
     [totalHeight, viewportHeight]
   );
 
+  const leftCtx = useMemo<RenderContext>(
+    () => ({
+      mode: 'left',
+      displayItems: displayItems as DisplayItem<SplitRow | UnifiedRow>[],
+      offsets,
+      language,
+      wordWrap,
+      fontSizeRem,
+      lineHeightPx,
+      searchQuery,
+      activeHunkIndex,
+      expandedLongLines: expandedLongLinesRef.current,
+      epoch: ++renderEpochRef.current,
+    }),
+    [displayItems, offsets, language, wordWrap, fontSizeRem, lineHeightPx, searchQuery, activeHunkIndex]
+  );
+
+  const rightCtx = useMemo<RenderContext>(
+    () => ({
+      ...leftCtx,
+      mode: 'right',
+    }),
+    [leftCtx]
+  );
+
+  const unifiedCtx = useMemo<RenderContext>(
+    () => ({
+      ...leftCtx,
+      mode: 'unified',
+    }),
+    [leftCtx]
+  );
+
+  const latestCtxRef = useRef({ leftCtx, rightCtx, unifiedCtx, viewportHeight });
+  latestCtxRef.current = { leftCtx, rightCtx, unifiedCtx, viewportHeight };
+
   useEffect(() => {
-    updateThumbDom(leftScrollTop);
-  }, [leftScrollTop, updateThumbDom]);
+    if (viewMode === 'split') {
+      unifiedPoolRef.current.clearAll();
+      leftPoolRef.current.attach(leftInnerRef.current);
+      rightPoolRef.current.attach(rightInnerRef.current);
+      const lTop = leftScrollRef.current?.scrollTop ?? 0;
+      const rTop = syncScroll ? lTop : rightScrollRef.current?.scrollTop ?? 0;
+      leftPoolRef.current.paint(lTop, viewportHeight, leftCtx);
+      rightPoolRef.current.paint(rTop, viewportHeight, rightCtx);
+      updateThumbDom(lTop);
+    } else {
+      leftPoolRef.current.clearAll();
+      rightPoolRef.current.clearAll();
+      unifiedPoolRef.current.attach(unifiedInnerRef.current);
+      const uTop = unifiedScrollRef.current?.scrollTop ?? 0;
+      unifiedPoolRef.current.paint(uTop, viewportHeight, unifiedCtx);
+      updateThumbDom(uTop);
+    }
+  }, [viewMode, syncScroll, viewportHeight, leftCtx, rightCtx, unifiedCtx, updateThumbDom]);
+
+  useEffect(() => {
+    const leftPool = leftPoolRef.current;
+    const rightPool = rightPoolRef.current;
+    const unifiedPool = unifiedPoolRef.current;
+    return () => {
+      leftPool.clearAll();
+      rightPool.clearAll();
+      unifiedPool.clearAll();
+    };
+  }, []);
 
   useEffect(() => {
     const target = viewMode === 'split' ? leftScrollRef.current : unifiedScrollRef.current;
     if (!target) return;
 
     const updateSize = () => {
-      setViewportHeight(target.clientHeight);
-      setPaneWidth(target.clientWidth);
+      const h = target.clientHeight;
+      const w = target.clientWidth;
+      setViewportHeight((prev) => (Math.abs(prev - h) > 0.5 ? h : prev));
+      setPaneWidth((prev) => (Math.abs(prev - w) > 0.5 ? w : prev));
     };
     updateSize();
 
     const observer = new ResizeObserver(updateSize);
     observer.observe(target);
     return () => observer.disconnect();
-  }, [viewMode]);
+  }, [viewMode, displayItems.length]);
 
   useEffect(() => {
     if (viewMode === 'split' && syncScroll && leftScrollRef.current && rightScrollRef.current) {
-      rightScrollRef.current.scrollTop = leftScrollRef.current.scrollTop;
-      rightScrollRef.current.scrollLeft = leftScrollRef.current.scrollLeft;
-      setRightScrollTop(leftScrollRef.current.scrollTop);
-    }
-  }, [syncScroll, viewMode]);
-
-  const scheduleScrollStateUpdate = useCallback((side: 'left' | 'right', nextTop: number) => {
-    if (side === 'left') {
-      pendingLeftTopRef.current = nextTop;
-      if (leftScrollRafRef.current === null) {
-        leftScrollRafRef.current = requestAnimationFrame(() => {
-          leftScrollRafRef.current = null;
-          setLeftScrollTop(pendingLeftTopRef.current);
-        });
+      const lTop = leftScrollRef.current.scrollTop;
+      const lLeft = leftScrollRef.current.scrollLeft;
+      suppressScrollRef.current.right = {
+        top: lTop,
+        left: wordWrap ? null : lLeft,
+        until: performance.now() + 80,
+      };
+      rightScrollRef.current.scrollTop = lTop;
+      if (!wordWrap) {
+        rightScrollRef.current.scrollLeft = lLeft;
       }
-    } else {
-      pendingRightTopRef.current = nextTop;
-      if (rightScrollRafRef.current === null) {
-        rightScrollRafRef.current = requestAnimationFrame(() => {
-          rightScrollRafRef.current = null;
-          setRightScrollTop(pendingRightTopRef.current);
-        });
-      }
+      rightPoolRef.current.paint(
+        lTop,
+        latestCtxRef.current.viewportHeight,
+        latestCtxRef.current.rightCtx
+      );
     }
-  }, []);
+  }, [syncScroll, viewMode, wordWrap]);
 
   const handlePaneScroll = useCallback(
     (side: 'left' | 'right', el: HTMLDivElement) => {
       const nextTop = el.scrollTop;
       const nextLeft = el.scrollLeft;
+      const sup = suppressScrollRef.current[side];
 
-      if (side === 'left' || syncScroll) {
-        updateThumbDom(nextTop);
+      if (
+        sup &&
+        performance.now() <= sup.until &&
+        Math.abs(nextTop - sup.top) <= 1.5 &&
+        (sup.left === null || Math.abs(nextLeft - sup.left) <= 1.5)
+      ) {
+        suppressScrollRef.current[side] = null;
+        return;
       }
+      suppressScrollRef.current[side] = null;
 
-      scheduleScrollStateUpdate(side, nextTop);
+      const {
+        leftCtx: lCtx,
+        rightCtx: rCtx,
+        viewportHeight: vh,
+      } = latestCtxRef.current;
+
+      if (side === 'left') {
+        updateThumbDom(nextTop);
+        leftPoolRef.current.paint(nextTop, vh, lCtx);
+      } else {
+        if (syncScroll) updateThumbDom(nextTop);
+        rightPoolRef.current.paint(nextTop, vh, rCtx);
+      }
 
       if (!syncScroll || viewMode !== 'split') return;
-      if (syncDriverRef.current && syncDriverRef.current !== side) return;
 
-      syncDriverRef.current = side;
+      const partnerSide = side === 'left' ? 'right' : 'left';
       const partner = side === 'left' ? rightScrollRef.current : leftScrollRef.current;
       if (partner) {
-        if (partner.scrollTop !== nextTop) {
-          partner.scrollTop = nextTop;
-          scheduleScrollStateUpdate(side === 'left' ? 'right' : 'left', nextTop);
+        const topDiff = Math.abs(partner.scrollTop - nextTop) > 0.5;
+        const leftDiff = !wordWrap && Math.abs(partner.scrollLeft - nextLeft) > 0.5;
+        if (topDiff || leftDiff) {
+          suppressScrollRef.current[partnerSide] = {
+            top: nextTop,
+            left: wordWrap ? null : nextLeft,
+            until: performance.now() + 80,
+          };
+          if (topDiff) partner.scrollTop = nextTop;
+          if (leftDiff) partner.scrollLeft = nextLeft;
         }
-        if (!wordWrap && partner.scrollLeft !== nextLeft) {
-          partner.scrollLeft = nextLeft;
+        if (partnerSide === 'right') {
+          rightPoolRef.current.paint(nextTop, vh, rCtx);
+        } else {
+          leftPoolRef.current.paint(nextTop, vh, lCtx);
         }
       }
-
-      if (syncUnlockRafRef.current) cancelAnimationFrame(syncUnlockRafRef.current);
-      syncUnlockRafRef.current = requestAnimationFrame(() => {
-        syncDriverRef.current = null;
-      });
     },
-    [syncScroll, viewMode, wordWrap, updateThumbDom, scheduleScrollStateUpdate]
+    [syncScroll, viewMode, wordWrap, updateThumbDom]
+  );
+
+  const handleUnifiedScroll = useCallback(
+    (el: HTMLDivElement) => {
+      const top = el.scrollTop;
+      updateThumbDom(top);
+      unifiedPoolRef.current.paint(
+        top,
+        latestCtxRef.current.viewportHeight,
+        latestCtxRef.current.unifiedCtx
+      );
+    },
+    [updateThumbDom]
   );
 
   useEffect(() => {
@@ -374,22 +875,6 @@ export const VirtualDiffViewer: React.FC<VirtualDiffViewerProps> = ({
       unifiedScrollRef.current?.scrollTo({ top: targetY, behavior: 'smooth' });
     }
   }, [activeHunkIndex, scrollTrigger, diff.hunks, viewMode, displayItems, offsets, viewportHeight]);
-
-  const leftWindow = useMemo(
-    () => findWindowBounds(offsets, displayItems.length, leftScrollTop, viewportHeight),
-    [offsets, displayItems.length, leftScrollTop, viewportHeight]
-  );
-
-  const rightWindow = useMemo(
-    () =>
-      findWindowBounds(
-        offsets,
-        displayItems.length,
-        syncScroll ? leftScrollTop : rightScrollTop,
-        viewportHeight
-      ),
-    [offsets, displayItems.length, syncScroll, leftScrollTop, rightScrollTop, viewportHeight]
-  );
 
   useEffect(() => {
     const canvas = minimapCanvasRef.current;
@@ -442,12 +927,30 @@ export const VirtualDiffViewer: React.FC<VirtualDiffViewerProps> = ({
       const rect = canvas.getBoundingClientRect();
       const ratio = Math.max(0, Math.min(1, (clientY - rect.top) / rect.height));
       const nextTop = ratio * Math.max(0, totalHeight - viewportHeight);
+      const {
+        leftCtx: lCtx,
+        rightCtx: rCtx,
+        unifiedCtx: uCtx,
+        viewportHeight: vh,
+      } = latestCtxRef.current;
 
       if (viewMode === 'split') {
-        if (leftScrollRef.current) leftScrollRef.current.scrollTop = nextTop;
-        if (syncScroll && rightScrollRef.current) rightScrollRef.current.scrollTop = nextTop;
+        if (leftScrollRef.current) {
+          leftScrollRef.current.scrollTop = nextTop;
+          leftPoolRef.current.paint(nextTop, vh, lCtx);
+        }
+        if (syncScroll && rightScrollRef.current) {
+          suppressScrollRef.current.right = {
+            top: nextTop,
+            left: null,
+            until: performance.now() + 80,
+          };
+          rightScrollRef.current.scrollTop = nextTop;
+          rightPoolRef.current.paint(nextTop, vh, rCtx);
+        }
       } else if (unifiedScrollRef.current) {
         unifiedScrollRef.current.scrollTop = nextTop;
+        unifiedPoolRef.current.paint(nextTop, vh, uCtx);
       }
       updateThumbDom(nextTop);
     },
@@ -466,14 +969,6 @@ export const VirtualDiffViewer: React.FC<VirtualDiffViewerProps> = ({
     };
   }, [isDraggingMinimap, handleMinimapJump]);
 
-  const handleCopyLine = useCallback((key: string, text: string) => {
-    void copyTextToClipboard(text).then((ok) => {
-      if (!ok) return;
-      setCopiedLineKey(key);
-      setTimeout(() => setCopiedLineKey((prev) => (prev === key ? null : prev)), 1200);
-    });
-  }, []);
-
   const expandFold = useCallback((foldId: string) => {
     setExpandedFolds((prev) => {
       const next = new Set(prev);
@@ -481,6 +976,62 @@ export const VirtualDiffViewer: React.FC<VirtualDiffViewerProps> = ({
       return next;
     });
   }, []);
+
+  const handleContainerClick = useCallback(
+    (mode: 'left' | 'right' | 'unified', e: React.MouseEvent<HTMLDivElement>) => {
+      const target = e.target as HTMLElement | null;
+      if (!target) return;
+
+      const foldBtn = target.closest<HTMLElement>('[data-fold-id]');
+      if (foldBtn?.dataset.foldId) {
+        expandFold(foldBtn.dataset.foldId);
+        return;
+      }
+
+      const expandBtn = target.closest<HTMLElement>('[data-expand-line]');
+      if (expandBtn?.dataset.expandLine) {
+        const key = expandBtn.dataset.expandLine;
+        expandedLongLinesRef.current.add(key);
+        const rawIdx = key.split('-')[1];
+        const origIdx = Number(rawIdx);
+        const list = latestCtxRef.current.leftCtx.displayItems;
+        const itemIndex = list.findIndex(
+          (it) => it.type === 'row' && it.originalIndex === origIdx
+        );
+        if (itemIndex !== -1) {
+          if (mode === 'left') {
+            leftPoolRef.current.repaintSingle(itemIndex, latestCtxRef.current.leftCtx);
+          } else if (mode === 'right') {
+            rightPoolRef.current.repaintSingle(itemIndex, latestCtxRef.current.rightCtx);
+          } else {
+            unifiedPoolRef.current.repaintSingle(itemIndex, latestCtxRef.current.unifiedCtx);
+          }
+        }
+        return;
+      }
+
+      const copyBtn = target.closest<HTMLButtonElement>('[data-copy-idx]');
+      if (copyBtn?.dataset.copyIdx) {
+        const itemIndex = Number(copyBtn.dataset.copyIdx);
+        const item = latestCtxRef.current.leftCtx.displayItems[itemIndex];
+        if (!item || item.type !== 'row') return;
+        const text =
+          mode === 'unified'
+            ? (item.row as UnifiedRow).text
+            : mode === 'left'
+            ? (item.row as SplitRow).leftText
+            : (item.row as SplitRow).rightText;
+        void copyTextToClipboard(text).then((ok) => {
+          if (!ok) return;
+          copyBtn.innerHTML = CHECK_SVG;
+          window.setTimeout(() => {
+            if (copyBtn.isConnected) copyBtn.innerHTML = COPY_SVG;
+          }, 1200);
+        });
+      }
+    },
+    [expandFold]
+  );
 
   const leftMinWidth = useMemo(() => {
     if (wordWrap) return undefined;
@@ -514,287 +1065,61 @@ export const VirtualDiffViewer: React.FC<VirtualDiffViewerProps> = ({
 
   const useSingleUnifiedScrollbar = viewMode === 'unified' || syncScroll;
 
-  const renderSplitSide = (
-    side: 'left' | 'right',
-    paneRef: React.RefObject<HTMLDivElement | null>,
-    bounds: { startIdx: number; endIdx: number },
-    minWidthPx: number | undefined
-  ) => (
-    <div
-      ref={paneRef}
-      onScroll={(e) => handlePaneScroll(side, e.currentTarget)}
-      className={`flex-1 min-w-0 overflow-auto relative select-text ${
-        useSingleUnifiedScrollbar ? 'hide-vertical-scrollbar diff-scroll' : 'diff-scroll'
-      } ${side === 'left' ? 'border-r border-[var(--border-hairline)]' : ''}`}
-    >
-      <div
-        style={{
-          height: `${totalHeight}px`,
-          minWidth: minWidthPx ? `${minWidthPx}px` : '100%',
-          position: 'relative',
-        }}
-      >
-        {Array.from({ length: Math.max(0, bounds.endIdx - bounds.startIdx + 1) }, (_, idx) => {
-          const itemIndex = bounds.startIdx + idx;
-          const item = displayItems[itemIndex];
-          if (!item) return null;
-
-          const top = offsets[itemIndex];
-          const rowHeight = offsets[itemIndex + 1] - top;
-
-          if (item.type === 'fold') {
-            return (
-              <div
-                key={`${side}-${item.id}`}
-                style={{
-                  position: 'absolute',
-                  top: `${top}px`,
-                  left: 0,
-                  right: 0,
-                  height: `${rowHeight}px`,
-                }}
-                className="diff-row-contain flex items-center justify-center bg-[var(--bg-subtle)] border-y border-[var(--border-hairline)] text-xs"
-              >
-                <button
-                  type="button"
-                  onClick={() => expandFold(item.id)}
-                  className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors cursor-pointer whitespace-nowrap"
-                >
-                  <ChevronsUpDown className="w-3.5 h-3.5" />
-                  <span className="font-mono tabular-nums">
-                    Show {item.count.toLocaleString()} lines
-                  </span>
-                </button>
-              </div>
-            );
-          }
-
-          const row = item.row as SplitRow;
-          const isActiveHunk = activeHunkIndex !== null && row.hunkIndex === activeHunkIndex;
-          const isLeft = side === 'left';
-          const lineNum = isLeft ? row.leftNum : row.rightNum;
-          const text = isLeft ? row.leftText : row.rightText;
-          const segments = isLeft ? row.leftSegments : row.rightSegments;
-
-          const paneBgStyle: React.CSSProperties | undefined = isLeft
-            ? row.kind === 'remove' || row.kind === 'modify'
-              ? { backgroundColor: 'var(--remove-bg)' }
-              : row.kind === 'add'
-              ? { backgroundColor: 'var(--bg-subtle)' }
-              : undefined
-            : row.kind === 'add' || row.kind === 'modify'
-            ? { backgroundColor: 'var(--add-bg)' }
-            : row.kind === 'remove'
-            ? { backgroundColor: 'var(--bg-subtle)' }
-            : undefined;
-
-          const gutterStyle: React.CSSProperties = isLeft
-            ? row.kind === 'remove' || row.kind === 'modify'
-              ? { backgroundColor: 'var(--remove-gutter)', color: 'var(--remove-fg)' }
-              : { backgroundColor: 'var(--bg-subtle)', color: 'var(--text-faint)' }
-            : row.kind === 'add' || row.kind === 'modify'
-            ? { backgroundColor: 'var(--add-gutter)', color: 'var(--add-fg)' }
-            : { backgroundColor: 'var(--bg-subtle)', color: 'var(--text-faint)' };
-
-          return (
-            <div
-              key={`${side}-${item.originalIndex}`}
-              style={{
-                position: 'absolute',
-                top: `${top}px`,
-                left: 0,
-                right: 0,
-                height: `${rowHeight}px`,
-                fontSize: `${fontSizeRem}rem`,
-                lineHeight: `${lineHeightPx}px`,
-                ...paneBgStyle,
-              }}
-              className={`diff-row-contain flex font-mono group ${
-                isActiveHunk ? 'ring-1 ring-inset ring-[var(--border-strong)]' : ''
-              }`}
-            >
-              <div
-                style={gutterStyle}
-                className="w-[2.25rem] sm:w-[3.25rem] shrink-0 px-1.5 sm:px-2 text-right select-none tabular-nums border-r border-[var(--border-hairline)]"
-              >
-                {lineNum ?? ''}
-              </div>
-              <div
-                className={`flex-1 min-w-0 px-2 sm:px-3 relative ${
-                  wordWrap ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
-                }`}
-              >
-                {lineNum !== null ? (
-                  <DiffLineContent
-                    text={text}
-                    language={language}
-                    segments={segments}
-                    changeKind={row.kind}
-                    side={side}
-                    searchQuery={searchQuery}
-                  />
-                ) : null}
-                {text && (
-                  <button
-                    type="button"
-                    onClick={() => handleCopyLine(`${side}-${item.originalIndex}`, text)}
-                    title="Copy line"
-                    className="opacity-0 group-hover:opacity-100 focus:opacity-100 absolute right-1.5 top-0.5 p-0.5 rounded bg-[var(--bg-elevated)] text-[var(--text-primary)] transition-opacity"
-                  >
-                    {copiedLineKey === `${side}-${item.originalIndex}` ? (
-                      <Check className="w-3 h-3 text-[var(--add-fg)]" />
-                    ) : (
-                      <Copy className="w-3 h-3" />
-                    )}
-                  </button>
-                )}
-              </div>
-            </div>
-          );
-        })}
-      </div>
-    </div>
-  );
-
   return (
     <div className="relative flex-1 flex min-h-0 overflow-hidden bg-[var(--bg-canvas)]">
       {viewMode === 'split' ? (
         <div className="flex-1 grid grid-cols-2 min-w-0 min-h-0 overflow-hidden">
-          {renderSplitSide('left', leftScrollRef, leftWindow, leftMinWidth)}
-          {renderSplitSide('right', rightScrollRef, rightWindow, rightMinWidth)}
+          <div
+            ref={leftScrollRef}
+            onScroll={(e) => handlePaneScroll('left', e.currentTarget)}
+            onClick={(e) => handleContainerClick('left', e)}
+            className={`flex-1 min-w-0 overflow-auto overscroll-contain relative select-text border-r border-[var(--border-hairline)] ${
+              useSingleUnifiedScrollbar ? 'hide-vertical-scrollbar diff-scroll' : 'diff-scroll'
+            }`}
+          >
+            <div
+              ref={leftInnerRef}
+              style={{
+                height: `${totalHeight}px`,
+                minWidth: leftMinWidth ? `${leftMinWidth}px` : '100%',
+                position: 'relative',
+              }}
+            />
+          </div>
+
+          <div
+            ref={rightScrollRef}
+            onScroll={(e) => handlePaneScroll('right', e.currentTarget)}
+            onClick={(e) => handleContainerClick('right', e)}
+            className={`flex-1 min-w-0 overflow-auto overscroll-contain relative select-text ${
+              useSingleUnifiedScrollbar ? 'hide-vertical-scrollbar diff-scroll' : 'diff-scroll'
+            }`}
+          >
+            <div
+              ref={rightInnerRef}
+              style={{
+                height: `${totalHeight}px`,
+                minWidth: rightMinWidth ? `${rightMinWidth}px` : '100%',
+                position: 'relative',
+              }}
+            />
+          </div>
         </div>
       ) : (
         <div
           ref={unifiedScrollRef}
-          onScroll={(e) => {
-            const top = e.currentTarget.scrollTop;
-            updateThumbDom(top);
-            scheduleScrollStateUpdate('left', top);
-          }}
-          className="diff-scroll hide-vertical-scrollbar flex-1 overflow-auto relative select-text"
+          onScroll={(e) => handleUnifiedScroll(e.currentTarget)}
+          onClick={(e) => handleContainerClick('unified', e)}
+          className="diff-scroll hide-vertical-scrollbar flex-1 overflow-auto overscroll-contain relative select-text"
         >
           <div
+            ref={unifiedInnerRef}
             style={{
               height: `${totalHeight}px`,
               minWidth: leftMinWidth ? `${leftMinWidth + rootFontPx * 2.5}px` : '100%',
               position: 'relative',
             }}
-          >
-            {Array.from(
-              { length: Math.max(0, leftWindow.endIdx - leftWindow.startIdx + 1) },
-              (_, idx) => {
-                const itemIndex = leftWindow.startIdx + idx;
-                const item = displayItems[itemIndex];
-                if (!item) return null;
-
-                const top = offsets[itemIndex];
-                const rowHeight = offsets[itemIndex + 1] - top;
-
-                if (item.type === 'fold') {
-                  return (
-                    <div
-                      key={item.id}
-                      style={{
-                        position: 'absolute',
-                        top: `${top}px`,
-                        left: 0,
-                        right: 0,
-                        height: `${rowHeight}px`,
-                      }}
-                      className="diff-row-contain flex items-center justify-center bg-[var(--bg-subtle)] border-y border-[var(--border-hairline)] text-xs"
-                    >
-                      <button
-                        type="button"
-                        onClick={() => expandFold(item.id)}
-                        className="inline-flex items-center gap-1.5 px-3 py-0.5 rounded text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--bg-hover)] transition-colors cursor-pointer whitespace-nowrap"
-                      >
-                        <ChevronsUpDown className="w-3.5 h-3.5" />
-                        <span className="font-mono tabular-nums">
-                          Show {item.count.toLocaleString()} unchanged lines
-                        </span>
-                      </button>
-                    </div>
-                  );
-                }
-
-                const row = item.row as UnifiedRow;
-                const isActiveHunk =
-                  activeHunkIndex !== null && row.hunkIndex === activeHunkIndex;
-                const rowBgStyle: React.CSSProperties | undefined =
-                  row.kind === 'remove'
-                    ? { backgroundColor: 'var(--remove-bg)' }
-                    : row.kind === 'add'
-                    ? { backgroundColor: 'var(--add-bg)' }
-                    : undefined;
-
-                return (
-                  <div
-                    key={`u-${item.originalIndex}`}
-                    style={{
-                      position: 'absolute',
-                      top: `${top}px`,
-                      left: 0,
-                      right: 0,
-                      height: `${rowHeight}px`,
-                      fontSize: `${fontSizeRem}rem`,
-                      lineHeight: `${lineHeightPx}px`,
-                      ...rowBgStyle,
-                    }}
-                    className={`diff-row-contain flex font-mono group ${
-                      isActiveHunk ? 'ring-1 ring-inset ring-[var(--border-strong)]' : ''
-                    }`}
-                  >
-                    <div className="w-[2.25rem] sm:w-[2.85rem] shrink-0 px-1.5 sm:px-2 text-right select-none tabular-nums border-r border-[var(--border-hairline)] bg-[var(--bg-subtle)] text-[var(--text-faint)]">
-                      {row.leftNum ?? ''}
-                    </div>
-                    <div className="w-[2.25rem] sm:w-[2.85rem] shrink-0 px-1.5 sm:px-2 text-right select-none tabular-nums border-r border-[var(--border-hairline)] bg-[var(--bg-subtle)] text-[var(--text-faint)]">
-                      {row.rightNum ?? ''}
-                    </div>
-                    <div
-                      style={{
-                        color:
-                          row.kind === 'remove'
-                            ? 'var(--remove-fg)'
-                            : row.kind === 'add'
-                            ? 'var(--add-fg)'
-                            : 'var(--text-faint)',
-                      }}
-                      className="w-[1.25rem] sm:w-[1.5rem] shrink-0 text-center select-none font-semibold"
-                    >
-                      {row.kind === 'remove' ? '-' : row.kind === 'add' ? '+' : ' '}
-                    </div>
-                    <div
-                      className={`flex-1 min-w-0 pr-5 relative ${
-                        wordWrap ? 'whitespace-pre-wrap break-all' : 'whitespace-pre'
-                      }`}
-                    >
-                      <DiffLineContent
-                        text={row.text}
-                        language={language}
-                        segments={row.segments}
-                        changeKind={row.kind}
-                        searchQuery={searchQuery}
-                      />
-                      {row.text && (
-                        <button
-                          type="button"
-                          onClick={() => handleCopyLine(`U-${item.originalIndex}`, row.text)}
-                          title="Copy line"
-                          className="opacity-0 group-hover:opacity-100 focus:opacity-100 absolute right-2 top-0.5 p-0.5 rounded bg-[var(--bg-elevated)] text-[var(--text-primary)] transition-opacity"
-                        >
-                          {copiedLineKey === `U-${item.originalIndex}` ? (
-                            <Check className="w-3 h-3 text-[var(--add-fg)]" />
-                          ) : (
-                            <Copy className="w-3 h-3" />
-                          )}
-                        </button>
-                      )}
-                    </div>
-                  </div>
-                );
-              }
-            )}
-          </div>
+          />
         </div>
       )}
 

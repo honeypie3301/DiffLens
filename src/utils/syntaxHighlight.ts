@@ -65,7 +65,7 @@ export interface TokenRun {
   className: string;
 }
 
-const CACHE_LIMIT = 5000;
+const CACHE_LIMIT = 12000;
 const tokenCache = new Map<string, TokenRun[]>();
 
 function decodeEntities(str: string): string {
@@ -173,6 +173,8 @@ export function highlightLineTokens(line: string, language: string): TokenRun[] 
   const key = `${language}\0${line}`;
   const cached = tokenCache.get(key);
   if (cached !== undefined) {
+    tokenCache.delete(key);
+    tokenCache.set(key, cached);
     return cached;
   }
 
